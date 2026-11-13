@@ -1,0 +1,51 @@
+services:
+  db:
+    # Docker Hub's postgis/postgis:16-3.4 is identical; we use the ghcr.io mirror
+    # because Docker Hub's CDN was dropping large-layer downloads on this network.
+    image: ghcr.io/baosystems/postgis:16-3.4
+    container_name: osint_db
+    environment:
+      POSTGRES_USER: osint
+      POSTGRES_PASSWORD: osint
+      POSTGRES_DB: osint
+    # No host port: the app reaches the DB over the internal docker network, and
+    # host port 5432 is already used by a native PostgreSQL on this machine.
+    # For psql access use: docker exec -it osint_db psql -U osint -d osint
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U osint -d osint"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  app:
+    build: ./backend
+    container_name: osint_app
+    environment:
+      DATABASE_URL: postgresql://osint:osint@db:5432/osint
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env (copy .env.example)}
+      TUNNEL_METRICS_URL: http://tunnel:2000   # lets the app discover its public URL
+    ports:
+      - "127.0.0.1:8000:8000"   # dashboard is local only; phones use the tunnel
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app       # live code reload in dev
+      - ./frontend:/frontend # served static dashboard
+
+  # Cloudflare quick tunnel: gives a random https://<name>.trycloudflare.com URL
+  # (no account needed) so a real phone can open the consent agent over HTTPS,
+  # which browsers require for GPS. The app only serves the consent-agent routes
+  # to requests arriving through this tunnel (see tunnel_guard in app.py).
+  tunnel:
+    image: cloudflare/cloudflared:2026.11.0   # pinned; bump deliberately
+    container_name: osint_tunnel
+    command: tunnel --metrics 0.0.0.0:2000 --url http://app:8000
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  pgdata:

@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Consent Location Agent</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    body { max-width: 520px; margin: 0 auto; }
+    .wrap { padding: 20px; }
+    .big { font-size: 15px; line-height: 1.5; }
+    .status { margin-top: 16px; font-size: 13px; }
+    .log { font-size: 12px; color: var(--muted); margin-top: 10px; max-height: 200px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <header><h1>📍 Consent Location Agent</h1></header>
+  <div class="ethics">
+    Halaman ini <b>hanya</b> mengirim lokasi jika Anda menekan "Setuju & Mulai" dan
+    memberi izin lokasi di browser. Anda bisa berhenti kapan saja. Tidak ada pelacakan diam-diam.
+  </div>
+  <div class="wrap">
+    <div class="card">
+      <div class="big">
+        <p><b>Tujuan:</b> mengirim lokasi GPS perangkat ini ke dashboard riset,
+        secara sadar dan atas persetujuan Anda.</p>
+        <p><b>Yang dikumpulkan:</b> latitude, longitude, akurasi, dan waktu — selama sesi aktif.</p>
+      </div>
+
+      <div id="consentInfo" class="status">Memuat consent…</div>
+
+      <label>Interval kirim (detik)</label>
+      <input id="interval" type="number" value="10" min="3" />
+
+      <button id="startBtn" onclick="start()">✅ Setuju & Mulai berbagi lokasi</button>
+      <button id="stopBtn" class="danger hidden" onclick="stop()">⏹️ Berhenti berbagi</button>
+
+      <div class="status" id="status">Status: idle.</div>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+
+  <script>
+    let sessionId = null, sessionToken = null, watchTimer = null, CONSENT_ID = null, wakeLock = null;
+    const params = new URLSearchParams(location.search);
+
+    // Keep the screen on while sharing: phone browsers pause timers when the
+    // screen sleeps, which would silently stop location updates.
+    async function keepAwake() {
+      try {
+        if ("wakeLock" in navigator) {
+          wakeLock = await navigator.wakeLock.request("screen");
+          wakeLock.addEventListener("release", () => { wakeLock = null; });
+          log("Layar dijaga tetap menyala selama berbagi lokasi.");
+        }
+      } catch (e) { log("Wake lock tidak tersedia: biarkan layar menyala manual."); }
+    }
+    document.addEventListener("visibilitychange", () => {
+      if (sessionId && document.visibilityState === "visible" && !wakeLock) keepAwake();
+    });
+
+    async function api(path, opts) {
+      const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.error || res.statusText);
+      return d;
+    }
+    function log(msg) {
+      const el = document.getElementById("log");
+      el.innerHTML = `<div>${new Date().toLocaleTimeString()} — ${msg}</div>` + el.innerHTML;
+    }
+    async function loadConsent() {
+      const info = document.getElementById("consentInfo");
+      CONSENT_ID = params.get("consent_id");
+      if (!CONSENT_ID) {
+        info.innerHTML = '<span class="pill bad">Tidak ada consent_id.</span> Buka halaman ini lewat "agent link" dari dashboard (tab Consent).';
+        document.getElementById("startBtn").disabled = true;
+        return;
+      }
+      try {
+        const c = await api("/v1/public/consent/" + CONSENT_ID);
+        if (c.status !== "active") {
+          info.innerHTML = `<span class="pill bad">Consent ${c.status}</span> — tidak bisa berbagi lokasi.`;
+          document.getElementById("startBtn").disabled = true;
+          return;
+        }
+        const esc = s => String(s ?? "").replace(/[&<>"']/g, ch =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+        info.innerHTML = `<b>Subjek:</b> ${esc(c.subject_label)}<br><b>Tujuan:</b> ${esc(c.purpose)}<br><span class="pill ok">consent aktif</span>`;
+      } catch (e) {
+        info.innerHTML = `<span class="pill bad">${e.message}</span>`;
+        document.getElementById("startBtn").disabled = true;
+      }
+    }
+
+    async function start() {
+      const consent_id = CONSENT_ID;
+      if (!consent_id) return alert("consent_id tidak ada di URL.");
+      if (!window.isSecureContext)
+        return alert("Halaman harus dibuka lewat HTTPS (link publik) agar GPS bisa dipakai.");
+      if (!navigator.geolocation) return alert("Browser tidak mendukung geolocation.");
+
+      const sess = await api("/v1/location/sessions", {
+        method: "POST", body: JSON.stringify({ consent_id, device_hint: navigator.userAgent.slice(0, 60) }),
+      });
+      sessionId = sess.session_id;
+      sessionToken = sess.session_token;   // write secret, kept only in this page's memory
+      document.getElementById("startBtn").classList.add("hidden");
+      document.getElementById("stopBtn").classList.remove("hidden");
+      document.getElementById("status").textContent = "Status: berbagi lokasi (sesi " + sessionId + ")";
+      log("Sesi dimulai. Meminta izin lokasi browser…");
+      keepAwake();
+
+      const send = () => {
+        // Bind this upload to the session that was current when it started, so a
+        // late failure cannot stop a session the user has since restarted.
+        const sid = sessionId, tok = sessionToken;
+        if (!sid) return;
+        navigator.geolocation.getCurrentPosition(async pos => {
+          if (sessionId !== sid) return;   // stopped while waiting for the GPS fix
+          try {
+            await api("/v1/location/points", {
+              method: "POST",
+              body: JSON.stringify({
+                session_id: sid,
+                session_token: tok,
+                latitude: pos.coords.latitude,
+                longitude: pos.coords.longitude,
+                accuracy_m: pos.coords.accuracy,
+              }),
+            });
+            log(`Terkirim: ${pos.coords.latitude.toFixed(5)}, ${pos.coords.longitude.toFixed(5)} (±${Math.round(pos.coords.accuracy)}m)`);
+          } catch (e) {
+            if (sessionId !== sid) return;   // an old session's upload; ignore
+            log("Ditolak server: " + e.message + " — berhenti.");
+            stop();
+          }
+        }, err => log("Izin/GPS error: " + err.message + (err.code === 1
+              ? " — izinkan lokasi untuk situs ini di pengaturan browser." : "")),
+           { enableHighAccuracy: true, timeout: 20000, maximumAge: 5000 });
+      };
+      send();
+      const secs = Math.max(3, parseInt(document.getElementById("interval").value) || 10);
+      watchTimer = setInterval(send, secs * 1000);
+    }
+
+    function stop() {
+      if (watchTimer) clearInterval(watchTimer);
+      if (sessionId && sessionToken) {
+        // Close the session server-side too (best effort; keepalive survives tab close).
+        fetch(`/v1/location/sessions/${encodeURIComponent(sessionId)}/close`, {
+          method: "POST", keepalive: true,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_token: sessionToken }),
+        }).catch(() => {});
+      }
+      watchTimer = null; sessionId = null; sessionToken = null;
+      if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+      document.getElementById("startBtn").classList.remove("hidden");
+      document.getElementById("stopBtn").classList.add("hidden");
+      document.getElementById("status").textContent = "Status: berhenti.";
+      log("Berbagi lokasi dihentikan.");
+    }
+
+    loadConsent();
+  </script>
+</body>
+</html>

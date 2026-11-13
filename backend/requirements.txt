@@ -1,0 +1,8 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+phonenumbers>=8.13
+pydantic>=2.9
+email-validator>=2.2
+pyjwt>=2.9
+psycopg[binary]>=3.2
+fpdf2>=2.7

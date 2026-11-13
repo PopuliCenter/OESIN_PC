@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OSINT & Consent-Based Location — Dashboard</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+  <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"
+          integrity="sha384-3zSEDfvllQohrq0PHL1fOXJuC/jSOO34H46t6UQfobFOmxE5BpjjaIJY5F2/bMnU"
+          crossorigin="anonymous"></script>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- LOGIN GATE -->
+  <div id="loginOverlay" class="overlay">
+    <div class="card login-card">
+      <h2>🔐 Masuk</h2>
+      <label>Username</label>
+      <input id="loginUser" placeholder="investigator" />
+      <label>Password</label>
+      <input id="loginPass" type="password" placeholder="••••••" onkeydown="if(event.key==='Enter')doLogin()" />
+      <button onclick="doLogin()">Login</button>
+      <div id="loginErr" class="pill bad hidden" style="margin-top:12px;"></div>
+      <div class="muted seed">
+        <b>Akun demo:</b><br>
+        admin / admin123 · investigator / invest123 · analyst / analyst123 ·
+        manager / manager123 · auditor / audit123
+      </div>
+    </div>
+  </div>
+
+  <div id="appShell" class="hidden">
+    <header>
+      <h1>🛰️ OSINT & Consent-Based Location Intelligence</h1>
+      <span class="badge">MVP · Phase 2</span>
+      <span style="flex:1"></span>
+      <span class="muted" id="whoami"></span>
+      <button class="secondary" style="margin:0;padding:6px 12px;" onclick="logout()">Logout</button>
+    </header>
+
+    <div class="ethics">
+      <b>Batas etika:</b> enrichment nomor = metadata publik/offline. Sistem <b>tidak</b>
+      mengambil GPS dari nomor. Lokasi hanya lewat <b>consent agent</b>. Akses raw GPS
+      dibatasi role (RBAC), semua aksi masuk audit trail.
+    </div>
+
+    <div class="tabs" id="tabs"></div>
+
+    <main>
+      <div class="stats" id="stats"></div>
+
+      <!-- LOOKUP -->
+      <section id="tab-lookup" class="grid tabpane">
+        <div class="card">
+          <h2>Identifier Lookup</h2>
+          <label>Nomor HP / email / domain / IP / username</label>
+          <input id="lookupValue" placeholder="+6281234567890  atau  0812xxxx" />
+          <label>Default region</label>
+          <select id="defaultRegion">
+            <option value="ID">ID — Indonesia</option>
+            <option value="">(none / sudah pakai +kode)</option>
+            <option value="US">US</option><option value="SG">SG</option>
+            <option value="MY">MY</option><option value="GB">GB</option>
+          </select>
+          <button onclick="doLookup()">Analyze</button>
+          <button class="secondary" onclick="downloadFile('/v1/reports/findings.csv','osint_findings.csv')">⬇ Export findings CSV</button>
+          <p class="muted">Enrichment offline via libphonenumber.</p>
+        </div>
+        <div class="card"><h2>Hasil</h2><div id="lookupResult"><p class="muted">Belum ada query.</p></div></div>
+      </section>
+
+      <!-- MAP + GEOFENCE -->
+      <section id="tab-map" class="tabpane hidden">
+        <div class="grid" style="grid-template-columns: 320px 1fr;">
+          <div>
+            <div class="card" style="margin-bottom:14px;">
+              <h2>Geofence baru</h2>
+              <label>Nama</label>
+              <input id="gfName" placeholder="mis. Area kampus" />
+              <label>Tipe</label>
+              <select id="gfKind" onchange="onKindChange()">
+                <option value="circle">Circle (pusat + radius)</option>
+                <option value="polygon">Polygon (gambar area)</option>
+              </select>
+              <div id="gfCircleOpts">
+                <label>Radius (meter)</label>
+                <input id="gfRadius" type="number" value="300" min="10" />
+              </div>
+              <button id="gfStartBtn" onclick="startDrawing()">✏️ Mulai gambar di peta</button>
+              <div id="gfPolyControls" class="hidden">
+                <p class="muted" id="gfVertexInfo">0 titik.</p>
+                <div class="row">
+                  <button onclick="finishPolygon()" style="flex:1;">✅ Simpan</button>
+                  <button class="secondary" onclick="undoVertex()" style="flex:0 0 auto;">↶</button>
+                  <button class="danger" onclick="cancelDrawing()" style="flex:0 0 auto;">✕</button>
+                </div>
+              </div>
+              <p class="muted" id="gfHint">Isi nama, pilih tipe, lalu klik "Mulai gambar".</p>
+            </div>
+            <div class="card">
+              <h2>Geofences</h2>
+              <div id="gfList"><p class="muted">—</p></div>
+            </div>
+          </div>
+          <div>
+            <div class="card" style="margin-bottom:14px;">
+              <div class="row">
+                <div><label>Filter consent</label><select id="mapConsent"><option value="">Semua</option></select></div>
+                <div><label>Precision</label>
+                  <select id="mapPrecision">
+                    <option value="exact">Exact (raw)</option>
+                    <option value="reduced">Reduced (~110m)</option>
+                    <option value="area">Area (~1.1km)</option>
+                  </select>
+                </div>
+                <div style="flex:0 0 auto;"><button class="secondary" onclick="loadMap()">Refresh</button></div>
+              </div>
+              <div class="row" style="margin-top:10px;">
+                <div style="flex:0 0 auto;">
+                  <button id="heatBtn" class="secondary" onclick="toggleHeatmap()">🔥 Heatmap: off</button>
+                </div>
+                <div><label style="margin:0;">Ukuran sel density</label>
+                  <select id="heatCell" onchange="if(heatOn){renderHeatmap();}">
+                    <option value="100">100 m</option>
+                    <option value="250" selected>250 m</option>
+                    <option value="500">500 m</option>
+                    <option value="1000">1 km</option>
+                  </select>
+                </div>
+                <div id="heatInfo" class="muted" style="align-self:end;"></div>
+              </div>
+            </div>
+            <div id="map"></div>
+            <div class="card" style="margin-top:14px;">
+              <h2>Geofence Events (enter/exit)</h2>
+              <div id="gfEvents"><p class="muted">—</p></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CONSENT -->
+      <section id="tab-consent" class="grid tabpane hidden">
+        <div class="card">
+          <h2>Buat Consent Baru</h2>
+          <label>Label subjek</label>
+          <input id="cSubject" placeholder="mis. Device milik saya (test)" />
+          <label>Tujuan penggunaan</label>
+          <input id="cPurpose" placeholder="mis. Uji coba consent-based tracking" />
+          <label>Retention (hari) — lama raw GPS disimpan</label>
+          <input id="cRetention" type="number" value="30" min="1" max="3650" />
+          <label>Nomor HP subjek (opsional) — tautkan identitas OSINT</label>
+          <input id="cPhone" placeholder="mis. 081908823122 (kosongkan jika tak perlu)" />
+          <button onclick="createConsent()">Grant Consent</button>
+        </div>
+        <div class="card">
+          <h2>Daftar Consent</h2>
+          <div id="tunnelStatus" class="muted" style="margin-bottom:10px;"></div>
+          <div id="consentList"><p class="muted">Memuat…</p></div>
+        </div>
+      </section>
+
+      <!-- ANALYTICS -->
+      <section id="tab-analytics" class="tabpane hidden">
+        <div class="card" style="margin-bottom:14px;">
+          <div class="row">
+            <div><label>Consent</label><select id="anConsent"></select></div>
+            <div><label>Geofence (untuk "titik dalam area")</label><select id="anGeofence"><option value="">—</option></select></div>
+            <div style="flex:0 0 auto;"><button onclick="runAnalytics()">Hitung</button></div>
+          </div>
+          <div class="row" style="margin-top:10px;align-items:center;">
+            <div class="muted" style="flex:0 0 auto;align-self:center;">Export laporan (case = consent terpilih):</div>
+            <div style="flex:0 0 auto;"><button class="secondary" onclick="exportCase('pdf')">📄 PDF</button></div>
+            <div style="flex:0 0 auto;"><button class="secondary" onclick="exportCase('points')">⬇ CSV titik</button></div>
+            <div style="flex:0 0 auto;"><button class="secondary" onclick="exportCase('events')">⬇ CSV events</button></div>
+            <div style="flex:1;"></div>
+          </div>
+        </div>
+        <div class="stats" id="anStats"></div>
+        <div class="grid">
+          <div class="card">
+            <h2>Dwell per Geofence</h2>
+            <div id="anDwell"><p class="muted">—</p></div>
+          </div>
+          <div class="card">
+            <h2>Ringkasan Spasial</h2>
+            <div id="anDetail"><p class="muted">Pilih consent lalu klik Hitung.</p></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TIMELINE -->
+      <section id="tab-timeline" class="tabpane hidden">
+        <div class="card" style="margin-bottom:14px;">
+          <div class="row">
+            <div><label>Consent</label><select id="tlConsent"></select></div>
+            <div><label>Precision</label>
+              <select id="tlPrecision">
+                <option value="exact">Exact</option>
+                <option value="reduced">Reduced (~110m)</option>
+                <option value="area">Area (~1.1km)</option>
+              </select>
+            </div>
+            <div style="flex:0 0 auto;"><button onclick="loadTrack()">Muat track</button></div>
+          </div>
+        </div>
+        <div id="tlmap" style="height:420px;border-radius:12px;border:1px solid var(--border);"></div>
+        <div class="card" style="margin-top:14px;">
+          <div class="row" style="align-items:center;">
+            <button id="tlPlayBtn" onclick="togglePlay()" style="flex:0 0 auto;margin:0;">▶ Play</button>
+            <button class="secondary" onclick="tlReset()" style="flex:0 0 auto;margin:0;">⏮</button>
+            <input id="tlSlider" type="range" min="0" max="0" value="0" style="flex:1;" oninput="onScrub()" />
+            <select id="tlSpeed" onchange="if(tlTimer){stopPlay();startPlay();}" style="flex:0 0 auto;width:auto;" title="Kecepatan">
+              <option value="1">1×</option><option value="2">2×</option>
+              <option value="5" selected>5×</option><option value="10">10×</option>
+            </select>
+          </div>
+          <div id="tlInfo" class="muted" style="margin-top:10px;">Pilih consent lalu "Muat track".</div>
+        </div>
+      </section>
+
+      <!-- GRAPH -->
+      <section id="tab-graph" class="tabpane hidden">
+        <div class="card" style="margin-bottom:14px;">
+          <div class="row">
+            <div class="muted">Node = entity/identifier/consent/session/geofence. Edge = relasi (HAS_*, SESSION, OBSERVED_AT).</div>
+            <div style="flex:0 0 auto;"><button class="secondary" onclick="loadGraph()">Refresh graph</button></div>
+          </div>
+        </div>
+        <div id="graph" style="height:520px;border:1px solid var(--border);border-radius:12px;background:#0b0f18;"></div>
+      </section>
+
+      <!-- AUDIT -->
+      <section id="tab-audit" class="tabpane hidden">
+        <div class="card"><h2>Audit Trail (append-only)</h2><div id="auditList"><p class="muted">Memuat…</p></div></div>
+      </section>
+
+      <!-- USERS -->
+      <section id="tab-users" class="grid tabpane hidden">
+        <div class="card">
+          <h2>Buat User</h2>
+          <label>Username</label><input id="uName" />
+          <label>Password (min 6)</label><input id="uPass" type="password" />
+          <label>Role</label>
+          <select id="uRole">
+            <option value="investigator">investigator</option>
+            <option value="location_analyst">location_analyst</option>
+            <option value="case_manager">case_manager</option>
+            <option value="auditor">auditor</option>
+            <option value="admin">admin</option>
+          </select>
+          <button onclick="createUser()">Create</button>
+        </div>
+        <div class="card"><h2>Users</h2><div id="userList"><p class="muted">Memuat…</p></div></div>
+        <div class="card" style="grid-column:1/-1;">
+          <h2>🗑️ Retention Policy (raw GPS)</h2>
+          <p class="muted">Hapus titik GPS yang melewati batas retention per-consent (SDD §11). Aksi tercatat di audit.</p>
+          <div class="row" style="max-width:420px;">
+            <button class="secondary" onclick="retentionPreview()">Preview kedaluwarsa</button>
+            <button class="danger" onclick="retentionRun()">Jalankan purge</button>
+          </div>
+          <div id="retentionInfo" style="margin-top:12px;"></div>
+        </div>
+      </section>
+    </main>
+
+    <!-- QR modal: scan the public agent link with the subject's phone -->
+    <div id="qrModal" class="overlay hidden" onclick="if (event.target === this) closeQr()">
+      <div class="card" style="width:320px;text-align:center;">
+        <h2 style="margin-top:0;">📱 Scan di HP subjek</h2>
+        <div id="qrBox" style="display:inline-block;background:#fff;padding:12px;border-radius:8px;"></div>
+        <p class="muted" id="qrUrl" style="word-break:break-all;margin-top:12px;"></p>
+        <button class="secondary" onclick="copyQrUrl()">Salin link</button>
+        <button onclick="closeQr()">Tutup</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
