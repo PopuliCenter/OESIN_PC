@@ -99,3 +99,7 @@ a { color: var(--accent); }
   line-height: 1.7;
 }
 .login-card .seed b { color: var(--text); }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: var(--panel-2); }
+tr.clickable.selected td { background: rgba(79,140,255,.12); }
+.card h3 { font-size: 13px; margin: 20px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }

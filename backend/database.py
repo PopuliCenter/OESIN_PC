@@ -159,6 +159,35 @@ ALTER TABLE location_sessions ADD COLUMN IF NOT EXISTS write_token_hash text;
 ALTER TABLE consents ADD COLUMN IF NOT EXISTS phone_e164 text;
 ALTER TABLE consents ADD COLUMN IF NOT EXISTS entity_id text REFERENCES entities(id);
 
+-- Case management (PRD Phase 1, UC-08): a case groups consents + OSINT findings
+-- and scopes who may see them: case_manager/admin see every case, other roles
+-- see only cases they are members of. (No semicolons in comments: init_db
+-- splits this script on them.)
+CREATE TABLE IF NOT EXISTS cases (
+    id          text PRIMARY KEY,
+    title       text NOT NULL,
+    description text,
+    status      text NOT NULL DEFAULT 'open',
+    created_by  text REFERENCES users(id),
+    created_at  timestamptz NOT NULL,
+    closed_at   timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS case_members (
+    case_id  text NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    user_id  text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    added_by text,
+    added_at timestamptz NOT NULL,
+    PRIMARY KEY (case_id, user_id)
+);
+
+ALTER TABLE consents ADD COLUMN IF NOT EXISTS case_id text REFERENCES cases(id);
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS case_id text REFERENCES cases(id);
+
+CREATE INDEX IF NOT EXISTS idx_consents_case ON consents(case_id);
+CREATE INDEX IF NOT EXISTS idx_findings_case ON findings(case_id);
+CREATE INDEX IF NOT EXISTS idx_case_members_user ON case_members(user_id);
+
 CREATE INDEX IF NOT EXISTS idx_location_points_geom ON location_points USING GIST (geom);
 CREATE INDEX IF NOT EXISTS idx_location_points_session_time ON location_points(session_id, captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_geofences_polygon ON geofences USING GIST (polygon_geom);

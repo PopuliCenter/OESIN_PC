@@ -262,6 +262,7 @@ class UserCreate(BaseModel):
 class LookupRequest(BaseModel):
     value: str
     default_region: Optional[str] = None
+    case_id: Optional[str] = Field(None, pattern=r"^[A-Za-z0-9_]{1,64}$")
 
 
 class ConsentCreate(BaseModel):
@@ -270,6 +271,16 @@ class ConsentCreate(BaseModel):
     retention_days: int = Field(30, ge=1, le=3650)
     phone: Optional[str] = None            # optional: link a phone identity to the subject
     phone_region: Optional[str] = "ID"
+    case_id: Optional[str] = Field(None, pattern=r"^[A-Za-z0-9_]{1,64}$")
+
+
+class CaseCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=2000)
+
+
+class CaseMemberAdd(BaseModel):
+    username: str = Field(..., min_length=1, max_length=100)
 
 
 class PhoneLink(BaseModel):
@@ -391,6 +402,200 @@ def create_user(req: UserCreate,
 
 
 # ---------------------------------------------------------------------------
+# Case management (PRD Phase 1 / UC-08 / FR-10 "case access")
+#
+# A case groups consents and OSINT findings. case_manager and admin manage all
+# cases; investigators and location analysts only see cases they are members
+# of. Every case read is audited (acceptance criterion #1).
+# ---------------------------------------------------------------------------
+CASE_MANAGERS = {"admin", "case_manager"}
+CASE_ROLES = ("investigator", "case_manager", "location_analyst")
+
+
+def _case_or_403(conn, case_id: str, user: dict, *, need_open: bool = False) -> dict:
+    """Load a case the user may access. Non-members get 404 (not 403) so case
+    ids cannot be probed. need_open=True rejects adding data to a closed case."""
+    row = conn.execute("SELECT * FROM cases WHERE id=%s", (case_id,)).fetchone()
+    if row and user["role"] not in CASE_MANAGERS:
+        member = conn.execute(
+            "SELECT 1 FROM case_members WHERE case_id=%s AND user_id=%s",
+            (case_id, user["id"])).fetchone()
+        if not member:
+            row = None
+    if not row:
+        raise HTTPException(404, "Case not found.")
+    if need_open and row["status"] != "open":
+        raise HTTPException(409, "Case is closed; reopen it before adding data.")
+    return dict(row)
+
+
+@app.get("/v1/cases")
+def list_cases(user: dict = Depends(auth.require_roles(*CASE_ROLES))) -> dict[str, Any]:
+    scope = ""
+    params: tuple = ()
+    if user["role"] not in CASE_MANAGERS:
+        scope = "WHERE c.id IN (SELECT case_id FROM case_members WHERE user_id=%s)"
+        params = (user["id"],)
+    conn = db.get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT c.*, u.username AS created_by_username,"
+            " (SELECT COUNT(*) FROM consents x WHERE x.case_id=c.id) AS consent_count,"
+            " (SELECT COUNT(*) FROM findings f WHERE f.case_id=c.id) AS finding_count,"
+            " (SELECT COUNT(*) FROM case_members m WHERE m.case_id=c.id) AS member_count"
+            f" FROM cases c LEFT JOIN users u ON u.id=c.created_by {scope}"
+            " ORDER BY c.status, c.created_at DESC", params).fetchall()
+    finally:
+        conn.close()
+    return {"cases": db.rows_to_dicts(rows),
+            "can_manage": user["role"] in CASE_MANAGERS}
+
+
+@app.post("/v1/cases")
+def create_case(req: CaseCreate,
+                user: dict = Depends(auth.require_roles("case_manager"))) -> dict[str, Any]:
+    cid = db.new_id("case")
+    ts = db.now_iso()
+    conn = db.get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO cases (id, title, description, status, created_by, created_at)"
+            " VALUES (%s,%s,%s,'open',%s,%s)",
+            (cid, req.title.strip(), (req.description or "").strip() or None, user["id"], ts))
+        conn.execute(
+            "INSERT INTO case_members (case_id, user_id, added_by, added_at) VALUES (%s,%s,%s,%s)",
+            (cid, user["id"], user["username"], ts))
+        conn.commit()
+    finally:
+        conn.close()
+    db.audit("CASE_CREATE", "case", cid, req.title.strip(), actor=user["username"])
+    return {"id": cid, "title": req.title.strip(), "status": "open"}
+
+
+@app.get("/v1/cases/{case_id}")
+def get_case(case_id: str,
+             user: dict = Depends(auth.require_roles(*CASE_ROLES))) -> dict[str, Any]:
+    conn = db.get_conn()
+    try:
+        case = _case_or_403(conn, case_id, user)
+        members = db.rows_to_dicts(conn.execute(
+            "SELECT u.id, u.username, u.role, m.added_at FROM case_members m"
+            " JOIN users u ON u.id=m.user_id WHERE m.case_id=%s ORDER BY m.added_at",
+            (case_id,)).fetchall())
+        consents = db.rows_to_dicts(conn.execute(
+            "SELECT c.id, c.subject_label, c.purpose, c.retention_days, c.phone_e164,"
+            " c.granted_at, c.revoked_at,"
+            " (SELECT COUNT(*) FROM location_points p WHERE p.consent_id=c.id) AS point_count"
+            " FROM consents c WHERE c.case_id=%s ORDER BY c.granted_at DESC",
+            (case_id,)).fetchall())
+        findings = conn.execute(
+            "SELECT id, entity_id, finding_type, source, source_kind, data_json,"
+            " confidence, created_at FROM findings WHERE case_id=%s"
+            " ORDER BY created_at DESC LIMIT 200", (case_id,)).fetchall()
+    finally:
+        conn.close()
+    for c in consents:
+        c["status"] = "revoked" if c["revoked_at"] else "active"
+    out_findings = []
+    for r in findings:
+        d = dict(r)
+        d["data"] = d.pop("data_json")
+        out_findings.append(d)
+    db.audit("CASE_ACCESS", "case", case_id, actor=user["username"])
+    return {"case": case, "members": members, "consents": consents,
+            "findings": out_findings, "can_manage": user["role"] in CASE_MANAGERS}
+
+
+def _set_case_status(case_id: str, user: dict, status: str) -> dict[str, Any]:
+    conn = db.get_conn()
+    try:
+        _case_or_403(conn, case_id, user)
+        conn.execute("UPDATE cases SET status=%s, closed_at=%s WHERE id=%s",
+                     (status, db.now_iso() if status == "closed" else None, case_id))
+        conn.commit()
+    finally:
+        conn.close()
+    db.audit(f"CASE_{'CLOSE' if status == 'closed' else 'REOPEN'}", "case", case_id,
+             actor=user["username"])
+    return {"id": case_id, "status": status}
+
+
+@app.post("/v1/cases/{case_id}/close")
+def close_case(case_id: str,
+               user: dict = Depends(auth.require_roles("case_manager"))) -> dict[str, Any]:
+    return _set_case_status(case_id, user, "closed")
+
+
+@app.post("/v1/cases/{case_id}/reopen")
+def reopen_case(case_id: str,
+                user: dict = Depends(auth.require_roles("case_manager"))) -> dict[str, Any]:
+    return _set_case_status(case_id, user, "open")
+
+
+@app.post("/v1/cases/{case_id}/members")
+def add_case_member(case_id: str, req: CaseMemberAdd,
+                    user: dict = Depends(auth.require_roles("case_manager"))) -> dict[str, Any]:
+    conn = db.get_conn()
+    try:
+        _case_or_403(conn, case_id, user)
+        target = conn.execute(
+            "SELECT id, username, role FROM users WHERE username=%s AND status='active'",
+            (req.username.strip(),)).fetchone()
+        if not target:
+            raise HTTPException(404, "User not found.")
+        if target["role"] not in CASE_ROLES and target["role"] != "admin":
+            raise HTTPException(422, f"Role '{target['role']}' cannot be a case member.")
+        conn.execute(
+            "INSERT INTO case_members (case_id, user_id, added_by, added_at)"
+            " VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+            (case_id, target["id"], user["username"], db.now_iso()))
+        conn.commit()
+    finally:
+        conn.close()
+    db.audit("CASE_MEMBER_ADD", "case", case_id, target["username"], actor=user["username"])
+    return {"case_id": case_id, "user_id": target["id"], "username": target["username"]}
+
+
+@app.delete("/v1/cases/{case_id}/members/{user_id}")
+def remove_case_member(case_id: str, user_id: str,
+                       user: dict = Depends(auth.require_roles("case_manager"))) -> dict[str, Any]:
+    conn = db.get_conn()
+    try:
+        _case_or_403(conn, case_id, user)
+        removed = conn.execute("DELETE FROM case_members WHERE case_id=%s AND user_id=%s",
+                               (case_id, user_id)).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    if not removed:
+        raise HTTPException(404, "Member not found.")
+    db.audit("CASE_MEMBER_REMOVE", "case", case_id, user_id, actor=user["username"])
+    return {"case_id": case_id, "user_id": user_id, "status": "removed"}
+
+
+@app.post("/v1/cases/{case_id}/consents/{consent_id}")
+def attach_consent_to_case(case_id: str, consent_id: str,
+                           user: dict = Depends(
+                               auth.require_roles("investigator", "case_manager"))
+                           ) -> dict[str, Any]:
+    conn = db.get_conn()
+    try:
+        _case_or_403(conn, case_id, user, need_open=True)
+        row = conn.execute("SELECT case_id FROM consents WHERE id=%s", (consent_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Consent not found.")
+        # Moving a consent out of another case requires access to that case too.
+        if row["case_id"] and row["case_id"] != case_id:
+            _case_or_403(conn, row["case_id"], user)
+        conn.execute("UPDATE consents SET case_id=%s WHERE id=%s", (case_id, consent_id))
+        conn.commit()
+    finally:
+        conn.close()
+    db.audit("CASE_ATTACH_CONSENT", "case", case_id, consent_id, actor=user["username"])
+    return {"case_id": case_id, "consent_id": consent_id}
+
+
+# ---------------------------------------------------------------------------
 # OSINT enrichment
 # ---------------------------------------------------------------------------
 @app.post("/v1/lookup")
@@ -400,6 +605,12 @@ def lookup(req: LookupRequest,
     id_type = enr.classify_identifier(req.value)
     if id_type == "unknown":
         raise HTTPException(422, "Could not classify identifier.")
+    if req.case_id:   # check before doing any (possibly online) collection
+        conn = db.get_conn()
+        try:
+            _case_or_403(conn, req.case_id, user, need_open=True)
+        finally:
+            conn.close()
 
     normalized = enr.normalize(id_type, req.value)
     display = normalized or req.value
@@ -430,19 +641,24 @@ def lookup(req: LookupRequest,
     try:
         conn.execute(
             "INSERT INTO findings (id, entity_id, finding_type, source, source_kind,"
-            " data_json, confidence, collected_at, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            " data_json, confidence, collected_at, created_at, case_id)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (finding_id, entity_id, f"{id_type}_enrichment",
              finding_data.get("source", "normalizer"),
              finding_data.get("source_kind", "offline_local"),
-             json.dumps(finding_data), confidence, db.now_iso(), db.now_iso()))
+             json.dumps(finding_data), confidence, db.now_iso(), db.now_iso(),
+             req.case_id))
         conn.commit()
     finally:
         conn.close()
 
-    db.audit("LOOKUP", "identifier", normalized or req.value, id_type, actor=user["username"])
+    db.audit("LOOKUP", "identifier", normalized or req.value,
+             id_type + (f" case={req.case_id}" if req.case_id else ""),
+             actor=user["username"])
     return {"identifier_type": id_type, "normalized": normalized,
             "confidence": confidence, "entity_id": entity_id,
-            "finding_id": finding_id, "enrichment": finding_data}
+            "finding_id": finding_id, "case_id": req.case_id,
+            "enrichment": finding_data}
 
 
 @app.get("/v1/findings")
@@ -476,6 +692,13 @@ def create_consent(req: ConsentCreate,
     # Optional: resolve a phone identity and link it to this subject. Uses the
     # same entity resolution as /v1/lookup, so a number already looked up maps
     # to the SAME entity (OSINT identity and tracked subject become one).
+    if req.case_id:
+        conn = db.get_conn()
+        try:
+            _case_or_403(conn, req.case_id, user, need_open=True)
+        finally:
+            conn.close()
+
     phone_e164 = None
     entity_id = None
     if req.phone and req.phone.strip():
@@ -490,20 +713,22 @@ def create_consent(req: ConsentCreate,
     try:
         conn.execute(
             "INSERT INTO consents (id, subject_label, purpose, policy_version,"
-            " retention_days, phone_e164, entity_id, granted_at)"
-            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            " retention_days, phone_e164, entity_id, case_id, granted_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (cid, req.subject_label, req.purpose, POLICY_VERSION,
-             req.retention_days, phone_e164, entity_id, db.now_iso()))
+             req.retention_days, phone_e164, entity_id, req.case_id, db.now_iso()))
         conn.commit()
     finally:
         conn.close()
     db.audit("CONSENT_GRANT", "consent", cid,
              f"{req.purpose} (retention {req.retention_days}d"
-             + (f", phone {phone_e164}" if phone_e164 else "") + ")",
+             + (f", phone {phone_e164}" if phone_e164 else "")
+             + (f", case {req.case_id}" if req.case_id else "") + ")",
              actor=user["username"])
     return {"consent_id": cid, "policy_version": POLICY_VERSION, "status": "active",
             "retention_days": req.retention_days, "phone_e164": phone_e164,
-            "entity_id": entity_id, "agent_link": f"/consent?consent_id={cid}"}
+            "entity_id": entity_id, "case_id": req.case_id,
+            "agent_link": f"/consent?consent_id={cid}"}
 
 
 @app.post("/v1/consents/{consent_id}/revoke")
@@ -1083,6 +1308,7 @@ def summary(user: dict = Depends(auth.current_user)) -> dict[str, Any]:
             return conn.execute(
                 f"SELECT COUNT(*) AS n FROM {table} {where}").fetchone()["n"]
         return {
+            "cases_open": count("cases", "WHERE status='open'"),
             "entities": count("entities"),
             "findings": count("findings"),
             "consents_active": count("consents", "WHERE revoked_at IS NULL"),

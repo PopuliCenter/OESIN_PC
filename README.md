@@ -63,8 +63,25 @@ berbasis consent**. Semua jalan lewat Docker Compose.
 
 PDF dibuat dengan `fpdf2` (pure-Python). Tombol export ada di tab **Analytics**
 (PDF / CSV titik / CSV events) dan tab **Lookup** (findings CSV). Download via
-fetch ber-token (`downloadFile`), bukan link biasa. *Case = consent* di MVP ini;
-entitas case penuh (banyak consent/findings per case) = langkah lanjutan.
+fetch ber-token (`downloadFile`), bukan link biasa. Export laporan masih per-consent;
+consent & findings kini bisa dikelompokkan ke **case** (lihat di bawah).
+
+### Case management (PRD Phase 1, UC-08)
+| Kemampuan | Endpoint | Role |
+|---|---|---|
+| Daftar case (case_manager/admin: semua; lainnya: hanya case yang diikuti) | `GET /v1/cases` | investigator, case_manager, location_analyst |
+| Buat case (pembuat otomatis jadi anggota) | `POST /v1/cases` | case_manager |
+| Detail case: anggota, consent, findings — **setiap akses tercatat `CASE_ACCESS`** | `GET /v1/cases/{id}` | anggota / case_manager |
+| Tutup / buka kembali case (case tertutup menolak data baru, 409) | `POST /v1/cases/{id}/close`, `/reopen` | case_manager |
+| Tambah / keluarkan anggota | `POST /v1/cases/{id}/members`, `DELETE /v1/cases/{id}/members/{user_id}` | case_manager |
+| Tautkan consent yang sudah ada ke case | `POST /v1/cases/{id}/consents/{consent_id}` | investigator (anggota), case_manager |
+| Simpan finding / consent baru langsung ke case | field `case_id` di `POST /v1/lookup` & `POST /v1/consents` | investigator (anggota), case_manager |
+
+Bukan anggota → **404** (bukan 403) agar id case tidak bisa ditebak. Tab **📁 Cases**
+di dashboard; selector case juga ada di tab Lookup dan Consent.
+*Batas saat ini:* scoping per-case baru berlaku untuk endpoint `/v1/cases*`.
+Endpoint lama (titik lokasi, analytics, graph, findings list) belum difilter per
+keanggotaan case — itu langkah ABAC berikutnya.
 
 ### Phase 3 (privacy controls, SDD §11)
 | Kemampuan | Endpoint / mekanisme |
@@ -87,6 +104,8 @@ entitas case penuh (banyak consent/findings per case) = langkah lanjutan.
 | Retention preview / purge | admin |
 | Audit | auditor |
 | Users | admin |
+| Case create / close / anggota | case_manager |
+| Case view / tambah data | anggota case (investigator, location_analyst) + case_manager |
 | Consent agent (session + point) | **publik**, gated oleh consent aktif (subjek, bukan operator) |
 
 ## Akun demo
@@ -166,7 +185,7 @@ atau lewat API (`POST /v1/geofences`, kind=polygon dengan array `[[lat,lng],...]
 
 ## Catatan produksi (belum di MVP)
 
-Auth OIDC + MFA, ABAC per-case, precision tiers & retention policy, graph DB
+Auth OIDC + MFA, ABAC per-case penuh di semua endpoint, graph DB
 (Neo4j), queue/collectors, hardening keamanan (rate limit, secrets manager),
 observability. Enrichment online (reputasi/breach) = stub opt-in di `enrichment.py`.
 

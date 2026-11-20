@@ -4,6 +4,7 @@ let ROLE = localStorage.getItem("role") || null;
 let USERNAME = localStorage.getItem("username") || null;
 
 const TAB_ROLES = {
+  cases:     ["investigator", "case_manager", "location_analyst", "admin"],
   lookup:    ["investigator", "case_manager", "admin"],
   map:       ["location_analyst", "case_manager", "admin"],
   analytics: ["location_analyst", "case_manager", "admin"],
@@ -14,7 +15,7 @@ const TAB_ROLES = {
   users:     ["admin"],
 };
 const TAB_LABELS = {
-  lookup: "🔎 Lookup", map: "🗺️ Map & Geofence", analytics: "📈 Analytics",
+  cases: "📁 Cases", lookup: "🔎 Lookup", map: "🗺️ Map & Geofence", analytics: "📈 Analytics",
   timeline: "⏱️ Timeline", consent: "✅ Consent", graph: "🕸️ Entity Graph",
   audit: "📜 Audit", users: "👤 Users",
 };
@@ -99,7 +100,9 @@ function selectTab(name) {
   if (name === "map") { setTimeout(initMap, 50); loadConsentsInto("mapConsent"); loadGeofences(); loadMap(); }
   if (name === "analytics") { loadConsentsInto("anConsent"); loadGeofencesInto("anGeofence"); }
   if (name === "timeline") { setTimeout(initTlMap, 50); loadConsentsInto("tlConsent"); }
-  if (name === "consent") loadConsents();
+  if (name === "consent") { loadConsents(); loadCasesInto("cCase"); }
+  if (name === "lookup") loadCasesInto("lookupCase");
+  if (name === "cases") loadCases();
   if (name === "graph") setTimeout(loadGraph, 50);
   if (name === "audit") loadAudit();
   if (name === "users") { loadUsers(); document.getElementById("retentionInfo").innerHTML = ""; }
@@ -111,7 +114,7 @@ async function refreshStats() {
   try {
     const s = await api("/v1/summary");
     const cells = [
-      ["Entities", s.entities], ["Findings", s.findings],
+      ["Case open", s.cases_open], ["Entities", s.entities], ["Findings", s.findings],
       ["Consent aktif", s.consents_active], ["Titik lokasi", s.location_points],
       ["Geofences", s.geofences], ["Geo events", s.geofence_events],
       ["Audit", s.audit_events],
@@ -125,11 +128,12 @@ async function refreshStats() {
 async function doLookup() {
   const value = document.getElementById("lookupValue").value.trim();
   const default_region = document.getElementById("defaultRegion").value || null;
+  const case_id = document.getElementById("lookupCase").value || null;
   const box = document.getElementById("lookupResult");
   if (!value) { box.innerHTML = `<p class="muted">Masukkan identifier.</p>`; return; }
   box.innerHTML = `<p class="muted">Menganalisis…</p>`;
   try {
-    const r = await api("/v1/lookup", { method: "POST", body: JSON.stringify({ value, default_region }) });
+    const r = await api("/v1/lookup", { method: "POST", body: JSON.stringify({ value, default_region, case_id }) });
     const e = r.enrichment || {};
     let h = `<div class="kv">
       <div class="k">Tipe</div><div>${r.identifier_type}</div>
@@ -182,8 +186,11 @@ async function createConsent() {
   const purpose = document.getElementById("cPurpose").value.trim();
   const retention_days = parseInt(document.getElementById("cRetention").value) || 30;
   const phone = document.getElementById("cPhone").value.trim() || null;
+  const case_id = document.getElementById("cCase").value || null;
   if (!subject_label || !purpose) return alert("Isi label dan tujuan.");
-  await api("/v1/consents", { method: "POST", body: JSON.stringify({ subject_label, purpose, retention_days, phone }) });
+  try {
+    await api("/v1/consents", { method: "POST", body: JSON.stringify({ subject_label, purpose, retention_days, phone, case_id }) });
+  } catch (e) { return alert(e.message); }
   document.getElementById("cSubject").value = ""; document.getElementById("cPurpose").value = "";
   document.getElementById("cPhone").value = "";
   loadConsents(); refreshStats();
@@ -270,6 +277,152 @@ async function revoke(id) {
   if (!confirm("Revoke consent ini? Titik lokasi berikutnya akan ditolak.")) return;
   await api(`/v1/consents/${id}/revoke`, { method: "POST" });
   loadConsents(); refreshStats();
+}
+
+// ---- cases ----
+let CURRENT_CASE = null;
+const btnSm = 'style="margin:0 4px 0 0;padding:5px 10px;"';
+
+async function loadCasesInto(selId) {
+  const sel = document.getElementById(selId);
+  if (!sel) return;
+  const keep = sel.value;
+  try {
+    const { cases } = await api("/v1/cases");
+    sel.innerHTML = `<option value="">— tanpa case —</option>` + cases
+      .filter(c => c.status === "open")
+      .map(c => `<option value="${esc(c.id)}">${esc(c.title)}</option>`).join("");
+    if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
+  } catch (e) { sel.innerHTML = `<option value="">— tanpa case —</option>`; }
+}
+
+async function loadCases() {
+  const box = document.getElementById("caseList");
+  try {
+    const { cases, can_manage } = await api("/v1/cases");
+    document.getElementById("caseCreateCard").classList.toggle("hidden", !can_manage);
+    if (!cases.length) {
+      box.innerHTML = `<p class="muted">${can_manage ? "Belum ada case." : "Anda belum menjadi anggota case mana pun."}</p>`;
+      return;
+    }
+    box.innerHTML = `<table><tr><th>Case</th><th>Status</th><th>Isi</th></tr>` + cases.map(c => `
+      <tr class="clickable${c.id === CURRENT_CASE ? " selected" : ""}" data-id="${esc(c.id)}" onclick="openCase(this.dataset.id)">
+        <td><b>${esc(c.title)}</b><br><span class="muted">oleh ${esc(c.created_by_username || "—")}</span></td>
+        <td>${c.status === "open" ? '<span class="pill ok">open</span>' : '<span class="pill bad">closed</span>'}</td>
+        <td class="muted">${esc(c.consent_count)} consent · ${esc(c.finding_count)} finding · ${esc(c.member_count)} anggota</td>
+      </tr>`).join("") + `</table>`;
+  } catch (e) { box.innerHTML = `<p class="pill bad">${esc(e.message)}</p>`; }
+}
+
+async function createCase() {
+  const title = document.getElementById("caseTitle").value.trim();
+  const description = document.getElementById("caseDesc").value.trim() || null;
+  if (!title) return alert("Judul case wajib diisi.");
+  try {
+    const r = await api("/v1/cases", { method: "POST", body: JSON.stringify({ title, description }) });
+    document.getElementById("caseTitle").value = ""; document.getElementById("caseDesc").value = "";
+    CURRENT_CASE = r.id;
+    await loadCases(); openCase(r.id); refreshStats();
+  } catch (e) { alert(e.message); }
+}
+
+async function openCase(id) {
+  CURRENT_CASE = id;
+  document.querySelectorAll("#caseList tr.clickable").forEach(tr =>
+    tr.classList.toggle("selected", tr.dataset.id === id));
+  const box = document.getElementById("caseDetail");
+  box.innerHTML = `<p class="muted">Memuat…</p>`;
+  try {
+    const d = await api(`/v1/cases/${encodeURIComponent(id)}`);
+    const c = d.case, open = c.status === "open";
+    const canWrite = ["investigator", "case_manager", "admin"].includes(ROLE);
+    let h = `<div class="kv">
+      <div class="k">Judul</div><div><b>${esc(c.title)}</b></div>
+      <div class="k">Status</div><div>${open ? '<span class="pill ok">open</span>' : '<span class="pill bad">closed</span>'}</div>
+      <div class="k">Dibuat</div><div>${esc(new Date(c.created_at).toLocaleString())}</div>
+      <div class="k">Deskripsi</div><div>${esc(c.description || "—")}</div>
+    </div>`;
+    if (d.can_manage) {
+      h += `<button class="${open ? "danger" : "secondary"}" style="margin:12px 0 0;padding:5px 10px;" onclick="setCaseStatus('${esc(c.id)}','${open ? "close" : "reopen"}')">${open ? "Tutup case" : "Buka kembali"}</button>`;
+    }
+
+    // members
+    h += `<h3>Anggota</h3><table><tr><th>User</th><th>Role</th><th></th></tr>` + d.members.map(m => `
+      <tr><td>${esc(m.username)}</td><td><span class="pill warn">${esc(m.role)}</span></td>
+      <td>${d.can_manage ? `<button class="secondary" ${btnSm} data-uid="${esc(m.id)}" onclick="removeMember('${esc(c.id)}', this.dataset.uid)">Keluarkan</button>` : ""}</td></tr>`).join("") + `</table>`;
+    if (d.can_manage) {
+      h += `<div class="row" style="max-width:420px;"><input id="caseMemberName" placeholder="username" />
+        <button ${btnSm} onclick="addMember('${esc(c.id)}')">+ Tambah anggota</button></div>`;
+    }
+
+    // consents
+    h += `<h3>Consent (${d.consents.length})</h3>`;
+    h += !d.consents.length ? `<p class="muted">Belum ada consent di case ini.</p>` :
+      `<table><tr><th>Subjek</th><th>Status</th><th>Titik</th></tr>` + d.consents.map(x => `
+        <tr><td>${esc(x.subject_label)}${x.phone_e164 ? ` <span class="pill warn">${esc(x.phone_e164)}</span>` : ""}<br><span class="muted">${esc(x.purpose)}</span></td>
+        <td>${x.status === "active" ? '<span class="pill ok">active</span>' : '<span class="pill bad">revoked</span>'}</td>
+        <td>${esc(x.point_count)}</td></tr>`).join("") + `</table>`;
+    if (open && canWrite) {
+      h += `<div class="row" style="max-width:520px;"><select id="caseAttachConsent"></select>
+        <button class="secondary" ${btnSm} onclick="attachConsent('${esc(c.id)}')">Tautkan consent</button></div>`;
+    }
+
+    // findings
+    h += `<h3>Findings OSINT (${d.findings.length})</h3>`;
+    h += !d.findings.length ? `<p class="muted">Belum ada finding. Pilih case ini di tab Lookup saat melakukan query.</p>` :
+      `<table><tr><th>Waktu</th><th>Tipe</th><th>Sumber</th><th>Confidence</th></tr>` + d.findings.map(f => `
+        <tr><td>${esc(new Date(f.created_at).toLocaleString())}</td><td>${esc(f.finding_type)}</td>
+        <td>${esc(f.source)} <span class="muted">(${esc(f.source_kind)})</span></td>
+        <td>${esc((Number(f.confidence) * 100).toFixed(0))}%</td></tr>`).join("") + `</table>`;
+
+    box.innerHTML = h;
+    if (open && canWrite) fillAttachConsent(c.id, d.consents.map(x => x.id));
+  } catch (e) { box.innerHTML = `<p class="pill bad">${esc(e.message)}</p>`; }
+}
+
+async function fillAttachConsent(caseId, already) {
+  const sel = document.getElementById("caseAttachConsent");
+  if (!sel) return;
+  try {
+    const { consents } = await api("/v1/consents");
+    const avail = consents.filter(x => !already.includes(x.id));
+    sel.innerHTML = !avail.length ? `<option value="">(tidak ada consent lain)</option>` :
+      avail.map(x => `<option value="${esc(x.id)}">${esc(x.subject_label)} (${esc(x.status)})${x.case_id ? " — di case lain" : ""}</option>`).join("");
+  } catch (e) { sel.innerHTML = `<option value="">(gagal memuat)</option>`; }
+}
+
+async function attachConsent(caseId) {
+  const consentId = document.getElementById("caseAttachConsent").value;
+  if (!consentId) return;
+  try {
+    await api(`/v1/cases/${encodeURIComponent(caseId)}/consents/${encodeURIComponent(consentId)}`, { method: "POST" });
+    openCase(caseId); loadCases();
+  } catch (e) { alert(e.message); }
+}
+
+async function addMember(caseId) {
+  const username = document.getElementById("caseMemberName").value.trim();
+  if (!username) return;
+  try {
+    await api(`/v1/cases/${encodeURIComponent(caseId)}/members`, { method: "POST", body: JSON.stringify({ username }) });
+    openCase(caseId); loadCases();
+  } catch (e) { alert(e.message); }
+}
+
+async function removeMember(caseId, userId) {
+  if (!confirm("Keluarkan anggota ini dari case?")) return;
+  try {
+    await api(`/v1/cases/${encodeURIComponent(caseId)}/members/${encodeURIComponent(userId)}`, { method: "DELETE" });
+    openCase(caseId); loadCases();
+  } catch (e) { alert(e.message); }
+}
+
+async function setCaseStatus(caseId, action) {
+  if (action === "close" && !confirm("Tutup case? Data baru tidak bisa ditambahkan sampai dibuka kembali.")) return;
+  try {
+    await api(`/v1/cases/${encodeURIComponent(caseId)}/${action}`, { method: "POST" });
+    openCase(caseId); loadCases(); refreshStats();
+  } catch (e) { alert(e.message); }
 }
 
 // ---- audit ----

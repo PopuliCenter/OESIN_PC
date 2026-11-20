@@ -65,6 +65,8 @@
             <option value="US">US</option><option value="SG">SG</option>
             <option value="MY">MY</option><option value="GB">GB</option>
           </select>
+          <label>Case (opsional) — simpan finding ke case</label>
+          <select id="lookupCase" class="case-select"></select>
           <button onclick="doLookup()">Analyze</button>
           <button class="secondary" onclick="downloadFile('/v1/reports/findings.csv','osint_findings.csv')">⬇ Export findings CSV</button>
           <p class="muted">Enrichment offline via libphonenumber.</p>
@@ -154,6 +156,8 @@
           <input id="cRetention" type="number" value="30" min="1" max="3650" />
           <label>Nomor HP subjek (opsional) — tautkan identitas OSINT</label>
           <input id="cPhone" placeholder="mis. 081908823122 (kosongkan jika tak perlu)" />
+          <label>Case (opsional)</label>
+          <select id="cCase" class="case-select"></select>
           <button onclick="createConsent()">Grant Consent</button>
         </div>
         <div class="card">
@@ -231,6 +235,28 @@
           </div>
         </div>
         <div id="graph" style="height:520px;border:1px solid var(--border);border-radius:12px;background:#0b0f18;"></div>
+      </section>
+
+      <!-- CASES -->
+      <section id="tab-cases" class="grid tabpane hidden">
+        <div>
+          <div class="card" id="caseCreateCard" style="margin-bottom:14px;">
+            <h2>Buat Case</h2>
+            <label>Judul</label>
+            <input id="caseTitle" maxlength="200" placeholder="mis. Studi mobilitas responden — Batch A" />
+            <label>Deskripsi / dasar hukum (opsional)</label>
+            <textarea id="caseDesc" rows="3" maxlength="2000"></textarea>
+            <button onclick="createCase()">Create case</button>
+          </div>
+          <div class="card">
+            <h2>Daftar Case</h2>
+            <div id="caseList"><p class="muted">Memuat…</p></div>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Detail Case</h2>
+          <div id="caseDetail"><p class="muted">Pilih case di kiri. Setiap akses ke case tercatat di audit.</p></div>
+        </div>
       </section>
 
       <!-- AUDIT -->
