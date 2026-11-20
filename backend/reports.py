@@ -9,6 +9,7 @@ import csv
 import io
 from typing import Any, Optional
 
+import access
 import analytics
 import database as db
 
@@ -37,21 +38,26 @@ def points_csv(conn, consent_id: str) -> str:
           r["captured_at"], r["created_at"]] for r in rows])
 
 
-def events_csv(conn, consent_id: str) -> str:
+def events_csv(conn, consent_id: str, allowed: Optional[list[str]] = None) -> str:
+    # Caller has already checked access to the consent; also hide events from
+    # geofences of another case (possible for data created before scoping).
+    gsql, gparams = access.geofence_filter(allowed, "g.case_id")
     rows = conn.execute(
         "SELECT e.id, e.event_type, e.latitude, e.longitude, e.created_at, g.name"
         " FROM geofence_events e LEFT JOIN geofences g ON g.id=e.geofence_id"
-        " WHERE e.consent_id=%s ORDER BY e.created_at", (consent_id,)).fetchall()
+        f" WHERE e.consent_id=%s AND {gsql} ORDER BY e.created_at",
+        (consent_id, *gparams)).fetchall()
     return _csv_from_rows(
         ["event_id", "event_type", "geofence", "latitude", "longitude", "created_at"],
         [[r["id"], r["event_type"], r["name"], r["latitude"], r["longitude"],
           r["created_at"]] for r in rows])
 
 
-def findings_csv(conn) -> str:
+def findings_csv(conn, allowed: Optional[list[str]] = None) -> str:
+    csql, cparams = access.case_filter(allowed)
     rows = conn.execute(
         "SELECT id, entity_id, finding_type, source, source_kind, confidence, created_at"
-        " FROM findings ORDER BY created_at DESC").fetchall()
+        f" FROM findings WHERE {csql} ORDER BY created_at DESC", cparams).fetchall()
     return _csv_from_rows(
         ["finding_id", "entity_id", "finding_type", "source", "source_kind",
          "confidence", "created_at"],
@@ -60,7 +66,8 @@ def findings_csv(conn) -> str:
 
 
 # --- PDF ---------------------------------------------------------------------
-def build_pdf(conn, consent_id: str, generated_by: str, generated_at: str) -> bytes:
+def build_pdf(conn, consent_id: str, generated_by: str, generated_at: str,
+              allowed: Optional[list[str]] = None) -> bytes:
     from fpdf import FPDF
     from fpdf.enums import XPos, YPos
 
@@ -73,11 +80,13 @@ def build_pdf(conn, consent_id: str, generated_by: str, generated_at: str) -> by
 
     mv = analytics.movement_summary(conn, consent_id)
     area = analytics.activity_area(conn, consent_id)
-    dwell = analytics.dwell_by_geofence(conn, consent_id)["dwell"]
+    dwell = analytics.dwell_by_geofence(conn, consent_id, allowed)["dwell"]
+    # The audit trail is not case-scoped (it names actors and case ids from the
+    # consent's whole history), so only unrestricted readers get it.
     audit_rows = conn.execute(
         "SELECT action, actor, detail, created_at FROM audit_events"
         " WHERE resource_id=%s OR detail LIKE %s ORDER BY created_at DESC LIMIT 25",
-        (consent_id, f"%{consent_id}%")).fetchall()
+        (consent_id, f"%{consent_id}%")).fetchall() if allowed is None else None
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -146,7 +155,9 @@ def build_pdf(conn, consent_id: str, generated_by: str, generated_at: str) -> by
         para("No geofence enter/exit events for this consent.")
 
     h("Audit Trail (related, latest 25)")
-    if audit_rows:
+    if audit_rows is None:
+        para("Withheld: the audit trail is only included for case managers and admins.")
+    elif audit_rows:
         for a in audit_rows:
             para(f"{a['created_at']}  {a['actor']}  {a['action']}  {a['detail'] or ''}", 8)
     else:

@@ -15,16 +15,22 @@ import database as db
 _POINT_GEOG = "ST_SetSRID(ST_MakePoint(%(lng)s, %(lat)s), 4326)::geography"
 _POINT_GEOM = "ST_SetSRID(ST_MakePoint(%(lng)s, %(lat)s), 4326)"
 
+# A geofence only applies to consents in its own case; shared geofences
+# (case_id IS NULL) apply to every consent. Same scope for _FENCES_SQL.
+_FENCE_SCOPE = "(case_id IS NULL OR case_id = %(case_id)s)"
+
 _MATCH_SQL = f"""
 SELECT id, name FROM geofences
-WHERE (kind = 'circle' AND center_lat IS NOT NULL AND radius_m IS NOT NULL
+WHERE {_FENCE_SCOPE} AND (
+      (kind = 'circle' AND center_lat IS NOT NULL AND radius_m IS NOT NULL
        AND ST_DWithin(
            ST_SetSRID(ST_MakePoint(center_lng, center_lat), 4326)::geography,
            {_POINT_GEOG},
            radius_m))
    OR (kind = 'polygon' AND polygon_geom IS NOT NULL
-       AND ST_Contains(polygon_geom, {_POINT_GEOM}))
+       AND ST_Contains(polygon_geom, {_POINT_GEOM})))
 """
+_FENCES_SQL = f"SELECT id, name FROM geofences WHERE {_FENCE_SCOPE}"
 
 
 def polygon_wkt(polygon: list[list[float]]) -> str:
@@ -39,12 +45,14 @@ def polygon_wkt(polygon: list[list[float]]) -> str:
 def evaluate_point(conn, session_id: str, consent_id: str, point_id: str,
                    lat: float, lng: float) -> list[dict[str, Any]]:
     """
-    PostGIS check of a freshly-ingested point against all geofences; emit
-    enter/exit events on state changes. Returns the generated events.
+    PostGIS check of a freshly-ingested point against the geofences in scope
+    for its consent (its case's geofences + shared ones); emit enter/exit
+    events on state changes. Returns the generated events.
     """
-    params = {"lat": lat, "lng": lng}
+    row = conn.execute("SELECT case_id FROM consents WHERE id=%s", (consent_id,)).fetchone()
+    params = {"lat": lat, "lng": lng, "case_id": row["case_id"] if row else None}
     matched = {r["id"]: r["name"] for r in conn.execute(_MATCH_SQL, params).fetchall()}
-    all_fences = conn.execute("SELECT id, name FROM geofences").fetchall()
+    all_fences = conn.execute(_FENCES_SQL, params).fetchall()
 
     events: list[dict[str, Any]] = []
     for fence in all_fences:
@@ -78,4 +86,42 @@ def evaluate_point(conn, session_id: str, consent_id: str, point_id: str,
                 "INSERT INTO geofence_state (session_id, geofence_id, inside, updated_at)"
                 " VALUES (%s,%s,%s,%s)",
                 (session_id, fid, now_inside, db.now_iso()))
+    return events
+
+
+def close_out_of_scope(conn, consent_id: str, new_case_id) -> list[dict[str, Any]]:
+    """
+    A consent moving to another case takes the old case's geofences out of its
+    scope (evaluate_point no longer looks at them). Close every still-open
+    "inside" state for those fences with an exit event at the session's last
+    known point, so enter/exit pairs and dwell stay correct. Call inside the
+    same transaction as the case change.
+    """
+    rows = conn.execute("""
+        SELECT st.session_id, st.geofence_id, g.name
+        FROM geofence_state st
+        JOIN location_sessions ls ON ls.id = st.session_id
+        JOIN geofences g ON g.id = st.geofence_id
+        WHERE ls.consent_id = %s AND st.inside
+          AND g.case_id IS NOT NULL AND g.case_id IS DISTINCT FROM %s
+    """, (consent_id, new_case_id)).fetchall()
+    events: list[dict[str, Any]] = []
+    for r in rows:
+        last = conn.execute(
+            "SELECT id, latitude, longitude FROM location_points WHERE session_id=%s"
+            " ORDER BY captured_at DESC LIMIT 1", (r["session_id"],)).fetchone()
+        if last:   # points may already be purged by retention; then just clear state
+            eid = db.new_id("gfe")
+            conn.execute(
+                "INSERT INTO geofence_events (id, geofence_id, session_id, consent_id,"
+                " point_id, event_type, latitude, longitude, created_at)"
+                " VALUES (%s,%s,%s,%s,%s,'exit',%s,%s,%s)",
+                (eid, r["geofence_id"], r["session_id"], consent_id, last["id"],
+                 last["latitude"], last["longitude"], db.now_iso()))
+            events.append({"id": eid, "geofence_id": r["geofence_id"],
+                           "geofence_name": r["name"], "event_type": "exit"})
+        conn.execute(
+            "UPDATE geofence_state SET inside=FALSE, updated_at=%s"
+            " WHERE session_id=%s AND geofence_id=%s",
+            (db.now_iso(), r["session_id"], r["geofence_id"]))
     return events

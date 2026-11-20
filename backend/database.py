@@ -184,7 +184,11 @@ CREATE TABLE IF NOT EXISTS case_members (
 ALTER TABLE consents ADD COLUMN IF NOT EXISTS case_id text REFERENCES cases(id);
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS case_id text REFERENCES cases(id);
 
+-- Per-case geofences (NULL = shared area, evaluated for every consent)
+ALTER TABLE geofences ADD COLUMN IF NOT EXISTS case_id text REFERENCES cases(id);
+
 CREATE INDEX IF NOT EXISTS idx_consents_case ON consents(case_id);
+CREATE INDEX IF NOT EXISTS idx_geofences_case ON geofences(case_id);
 CREATE INDEX IF NOT EXISTS idx_findings_case ON findings(case_id);
 CREATE INDEX IF NOT EXISTS idx_case_members_user ON case_members(user_id);
 

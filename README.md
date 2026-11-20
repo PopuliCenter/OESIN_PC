@@ -78,10 +78,39 @@ consent & findings kini bisa dikelompokkan ke **case** (lihat di bawah).
 | Simpan finding / consent baru langsung ke case | field `case_id` di `POST /v1/lookup` & `POST /v1/consents` | investigator (anggota), case_manager |
 
 Bukan anggota → **404** (bukan 403) agar id case tidak bisa ditebak. Tab **📁 Cases**
-di dashboard; selector case juga ada di tab Lookup dan Consent.
-*Batas saat ini:* scoping per-case baru berlaku untuk endpoint `/v1/cases*`.
-Endpoint lama (titik lokasi, analytics, graph, findings list) belum difilter per
-keanggotaan case — itu langkah ABAC berikutnya.
+di dashboard; selector case juga ada di tab Lookup, Consent, dan Map & Geofence.
+
+### ABAC per-case (berlaku di semua endpoint)
+
+Role (RBAC) menentukan **aksi** apa yang boleh; keanggotaan case menentukan **data
+mana**. Semua aturan ada di satu modul: [backend/access.py](backend/access.py).
+
+| Siapa | Data yang terlihat |
+|---|---|
+| admin, case_manager | semua case + data **tanpa case** |
+| investigator, location_analyst | **hanya** data di case yang mereka ikuti; data tanpa case tidak terlihat |
+| auditor | audit trail + total hitungan organisasi di `/v1/summary` |
+
+- **Wajib pilih case**: investigator/analyst harus mengisi `case_id` (case yang mereka
+  ikuti) saat lookup dan membuat consent → tanpa itu **422**. Manager boleh tanpa case.
+- Titik lokasi, sesi, dan geofence event tidak punya `case_id` sendiri — **mewarisi
+  case dari consent-nya**. Berlaku untuk: daftar titik, analytics (movement, area,
+  heatmap, dwell, in-geofence), geofence events, export CSV/PDF, entity graph, summary.
+- **Geofence per-case**: geofence milik satu case hanya terlihat oleh anggota case itu
+  dan **hanya dievaluasi untuk consent di case itu**. Geofence tanpa case = **area
+  bersama**: terlihat semua, dievaluasi untuk semua consent, tapi hanya bisa
+  dibuat/dihapus case_manager/admin (analyst → 403).
+- Entity/identifier dipakai bersama lintas case (entity resolution exact-match);
+  sebuah entity terlihat bila ada finding/consent yang terlihat menunjuk ke entity itu.
+- Menautkan consent ke case (`POST /v1/cases/{id}/consents/{consent_id}`) mensyaratkan
+  consent itu sudah terlihat oleh pemanggil — non-manager tidak bisa "menarik" consent
+  case lain atau consent tanpa case ke case-nya.
+- Keanggotaan dibaca ulang tiap request: anggota yang dikeluarkan langsung kehilangan akses.
+
+> **Data lama (sebelum fitur ini) tidak punya case** → hanya terlihat oleh
+> case_manager/admin. Agar investigator/analyst bisa melihatnya, manager menautkan
+> consent tersebut ke case (tab **📁 Cases** → *Tautkan consent*). Geofence lama
+> otomatis menjadi **area bersama**.
 
 ### Phase 3 (privacy controls, SDD §11)
 | Kemampuan | Endpoint / mekanisme |
@@ -97,7 +126,8 @@ keanggotaan case — itu langkah ABAC berikutnya.
 |---|---|
 | Lookup / consent write | investigator, case_manager |
 | Findings / graph view | investigator, case_manager, location_analyst |
-| GPS points (presisi di-cap per role) / geofence CRUD | location_analyst (exact), case_manager (≤reduced) |
+| GPS points (presisi di-cap per role) | location_analyst (exact), case_manager (≤reduced) |
+| Geofence create / delete | location_analyst (geofence case-nya), case_manager (termasuk area bersama) |
 | Analytics (movement / area / dwell) | location_analyst, case_manager |
 | Analytics in-geofence (raw points) | location_analyst |
 | Geofence events | location_analyst, case_manager |
@@ -106,6 +136,8 @@ keanggotaan case — itu langkah ABAC berikutnya.
 | Users | admin |
 | Case create / close / anggota | case_manager |
 | Case view / tambah data | anggota case (investigator, location_analyst) + case_manager |
+
+Semua baris di atas **juga** dibatasi ABAC per-case (lihat bagian *ABAC per-case*).
 | Consent agent (session + point) | **publik**, gated oleh consent aktif (subjek, bukan operator) |
 
 ## Akun demo
@@ -185,7 +217,7 @@ atau lewat API (`POST /v1/geofences`, kind=polygon dengan array `[[lat,lng],...]
 
 ## Catatan produksi (belum di MVP)
 
-Auth OIDC + MFA, ABAC per-case penuh di semua endpoint, graph DB
+Auth OIDC + MFA, graph DB
 (Neo4j), queue/collectors, hardening keamanan (rate limit, secrets manager),
 observability. Enrichment online (reputasi/breach) = stub opt-in di `enrichment.py`.
 

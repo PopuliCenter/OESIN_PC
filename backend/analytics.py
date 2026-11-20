@@ -21,6 +21,12 @@ def _time_clause(from_ts: Optional[str], to_ts: Optional[str], params: dict) -> 
     return clause
 
 
+# Case scoping (see access.py). `allowed` = None means unrestricted; otherwise a
+# list of case ids. Points/events inherit their case from the consent; data in
+# no case is excluded for restricted users.
+_CONSENT_IN_CASES = "IN (SELECT id FROM consents WHERE case_id = ANY(%(allowed)s))"
+
+
 def movement_summary(conn, consent_id: str,
                      from_ts: Optional[str] = None,
                      to_ts: Optional[str] = None) -> dict[str, Any]:
@@ -85,13 +91,17 @@ def activity_area(conn, consent_id: str) -> dict[str, Any]:
 def points_in_geofence(conn, geofence_id: str,
                        from_ts: Optional[str] = None,
                        to_ts: Optional[str] = None,
-                       limit: int = 1000) -> dict[str, Any]:
+                       limit: int = 1000,
+                       allowed: Optional[list[str]] = None) -> dict[str, Any]:
     """
     Points that fall inside a geofence (polygon via ST_Contains, circle via
     ST_DWithin), optionally within a time window.
     """
     params: dict[str, Any] = {"gid": geofence_id, "limit": limit}
     tc = _time_clause(from_ts, to_ts, params).replace("captured_at", "p.captured_at")
+    if allowed is not None:
+        tc += f" AND p.consent_id {_CONSENT_IN_CASES}"
+        params["allowed"] = allowed
     rows = conn.execute(f"""
         SELECT p.id, p.consent_id, p.latitude, p.longitude, p.captured_at
         FROM location_points p
@@ -112,7 +122,8 @@ def points_in_geofence(conn, geofence_id: str,
 
 
 def heatmap_grid(conn, consent_id: Optional[str] = None, cell_m: int = 250,
-                 geofence_id: Optional[str] = None) -> dict[str, Any]:
+                 geofence_id: Optional[str] = None,
+                 allowed: Optional[list[str]] = None) -> dict[str, Any]:
     """
     Point-density grid computed in PostGIS: snap every point to a grid cell
     (ST_SnapToGrid), then GROUP BY cell counting points. Each cell returns the
@@ -125,6 +136,9 @@ def heatmap_grid(conn, consent_id: Optional[str] = None, cell_m: int = 250,
     if consent_id:
         where += " AND consent_id = %(cid)s"
         params["cid"] = consent_id
+    if allowed is not None:
+        where += f" AND consent_id {_CONSENT_IN_CASES}"
+        params["allowed"] = allowed
     if geofence_id:
         params["gid"] = geofence_id
         where += """
@@ -158,16 +172,22 @@ def heatmap_grid(conn, consent_id: Optional[str] = None, cell_m: int = 250,
             "cell_m": int(cell_m), "count_cells": len(cells)}
 
 
-def dwell_by_geofence(conn, consent_id: Optional[str] = None) -> dict[str, Any]:
+def dwell_by_geofence(conn, consent_id: Optional[str] = None,
+                      allowed: Optional[list[str]] = None) -> dict[str, Any]:
     """
     Dwell time per geofence, derived from enter/exit event pairs. Computed in
     Python by pairing each 'enter' with the next 'exit' within a session.
     """
     params: dict[str, Any] = {}
-    where = ""
+    where = "WHERE TRUE"
     if consent_id:
-        where = "WHERE e.consent_id = %(cid)s"
+        where += " AND e.consent_id = %(cid)s"
         params["cid"] = consent_id
+    if allowed is not None:
+        # visible consent AND visible geofence (shared or same-case)
+        where += (f" AND e.consent_id {_CONSENT_IN_CASES}"
+                  " AND (g.case_id IS NULL OR g.case_id = ANY(%(allowed)s))")
+        params["allowed"] = allowed
     rows = conn.execute(f"""
         SELECT e.geofence_id, e.session_id, e.event_type, e.created_at,
                g.name AS geofence_name

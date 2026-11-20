@@ -97,7 +97,7 @@ function selectTab(name) {
   document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x.dataset.tab === name));
   document.querySelectorAll(".tabpane").forEach(p =>
     p.classList.toggle("hidden", p.id !== "tab-" + name));
-  if (name === "map") { setTimeout(initMap, 50); loadConsentsInto("mapConsent"); loadGeofences(); loadMap(); }
+  if (name === "map") { setTimeout(initMap, 50); loadConsentsInto("mapConsent"); loadCasesInto("gfCase", "geofence"); loadGeofences(); loadMap(); }
   if (name === "analytics") { loadConsentsInto("anConsent"); loadGeofencesInto("anGeofence"); }
   if (name === "timeline") { setTimeout(initTlMap, 50); loadConsentsInto("tlConsent"); }
   if (name === "consent") { loadConsents(); loadCasesInto("cCase"); }
@@ -119,7 +119,7 @@ async function refreshStats() {
       ["Geofences", s.geofences], ["Geo events", s.geofence_events],
       ["Audit", s.audit_events],
     ];
-    document.getElementById("stats").innerHTML = cells.map(([l, n]) =>
+    document.getElementById("stats").innerHTML = cells.filter(([, n]) => n !== null && n !== undefined).map(([l, n]) =>
       `<div class="stat"><div class="n">${n}</div><div class="l">${l}</div></div>`).join("");
   } catch (e) {}
 }
@@ -131,38 +131,39 @@ async function doLookup() {
   const case_id = document.getElementById("lookupCase").value || null;
   const box = document.getElementById("lookupResult");
   if (!value) { box.innerHTML = `<p class="muted">Masukkan identifier.</p>`; return; }
+  if (!case_id && !isManager()) { box.innerHTML = `<p class="pill bad">Pilih case dulu.</p>`; return; }
   box.innerHTML = `<p class="muted">Menganalisis…</p>`;
   try {
     const r = await api("/v1/lookup", { method: "POST", body: JSON.stringify({ value, default_region, case_id }) });
     const e = r.enrichment || {};
     let h = `<div class="kv">
-      <div class="k">Tipe</div><div>${r.identifier_type}</div>
-      <div class="k">Normalized</div><div>${r.normalized || "—"}</div>
+      <div class="k">Tipe</div><div>${esc(r.identifier_type)}</div>
+      <div class="k">Normalized</div><div>${esc(r.normalized || "—")}</div>
       <div class="k">Confidence</div><div>${(r.confidence * 100).toFixed(0)}%</div>`;
     if (r.identifier_type === "phone") {
-      h += `<div class="k">Valid</div><div>${e.valid ? '<span class="pill ok">valid</span>' : '<span class="pill bad">tidak valid</span>'}</div>
-        <div class="k">Negara</div><div>${e.region || "—"} (+${e.country_code || "—"})</div>
-        <div class="k">Wilayah</div><div>${e.location || "—"}</div>
-        <div class="k">Operator</div><div>${e.carrier || "—"}</div>
-        <div class="k">Tipe line</div><div>${e.line_type || "—"}</div>
-        <div class="k">Timezone</div><div>${(e.timezones || []).join(", ") || "—"}</div>`;
+      h += `<div class="k">Valid</div><div>${esc(e.valid ? '<span class="pill ok">valid</span>' : '<span class="pill bad">tidak valid</span>')}</div>
+        <div class="k">Negara</div><div>${esc(e.region || "—")} (+${esc(e.country_code || "—")})</div>
+        <div class="k">Wilayah</div><div>${esc(e.location || "—")}</div>
+        <div class="k">Operator</div><div>${esc(e.carrier || "—")}</div>
+        <div class="k">Tipe line</div><div>${esc(e.line_type || "—")}</div>
+        <div class="k">Timezone</div><div>${esc((e.timezones || []).join(", ") || "—")}</div>`;
     } else if (r.identifier_type === "ip") {
       if (e.status === "success") {
-        h += `<div class="k">Negara</div><div>${e.country || "—"} (${e.country_code || "—"})</div>
-          <div class="k">Wilayah</div><div>${e.region || "—"}</div>
-          <div class="k">Kota</div><div>${e.city || "—"}</div>
-          <div class="k">Koordinat (perkiraan)</div><div>${e.latitude}, ${e.longitude}</div>
-          <div class="k">Timezone</div><div>${e.timezone || "—"}</div>
-          <div class="k">ISP / Org</div><div>${e.isp || "—"} / ${e.org || "—"}</div>
-          <div class="k">ASN</div><div>${e.asn || "—"}</div>
-          <div class="k">Proxy/Hosting/Mobile</div><div>${e.is_proxy ? "proxy " : ""}${e.is_hosting ? "hosting " : ""}${e.is_mobile ? "mobile" : ""} ${!(e.is_proxy||e.is_hosting||e.is_mobile) ? "—" : ""}</div>`;
+        h += `<div class="k">Negara</div><div>${esc(e.country || "—")} (${esc(e.country_code || "—")})</div>
+          <div class="k">Wilayah</div><div>${esc(e.region || "—")}</div>
+          <div class="k">Kota</div><div>${esc(e.city || "—")}</div>
+          <div class="k">Koordinat (perkiraan)</div><div>${esc(e.latitude)}, ${esc(e.longitude)}</div>
+          <div class="k">Timezone</div><div>${esc(e.timezone || "—")}</div>
+          <div class="k">ISP / Org</div><div>${esc(e.isp || "—")} / ${esc(e.org || "—")}</div>
+          <div class="k">ASN</div><div>${esc(e.asn || "—")}</div>
+          <div class="k">Proxy/Hosting/Mobile</div><div>${esc(e.is_proxy ? "proxy " : "")}${esc(e.is_hosting ? "hosting " : "")}${esc(e.is_mobile ? "mobile" : "")} ${!(e.is_proxy||e.is_hosting||e.is_mobile) ? "—" : ""}</div>`;
       } else {
-        h += `<div class="k">Status</div><div><span class="pill bad">${e.status}</span> ${e.error || ""}</div>`;
+        h += `<div class="k">Status</div><div><span class="pill bad">${esc(e.status)}</span> ${esc(e.error || "")}</div>`;
       }
     }
     h += `</div>`;
     if (r.identifier_type === "ip" && e.status === "success") {
-      h += `<p style="margin-top:8px;"><a href="https://www.openstreetmap.org/?mlat=${e.latitude}&mlon=${e.longitude}#map=11/${e.latitude}/${e.longitude}" target="_blank" rel="noopener">🗺️ Lihat perkiraan lokasi IP di OpenStreetMap</a></p>`;
+      h += `<p style="margin-top:8px;"><a href="https://www.openstreetmap.org/?mlat=${esc(e.latitude)}&mlon=${esc(e.longitude)}#map=11/${esc(e.latitude)}/${esc(e.longitude)}" target="_blank" rel="noopener">🗺️ Lihat perkiraan lokasi IP di OpenStreetMap</a></p>`;
     }
     if (r.identifier_type === "username") {
       const rows = (e.results || []).map(s => {
@@ -170,14 +171,14 @@ async function doLookup() {
           : s.status === "not_found" ? '<span class="pill bad">not found</span>'
           : s.status === "manual" ? '<span class="pill warn">cek manual</span>'
           : '<span class="pill">?</span>';
-        return `<tr><td>${s.site}</td><td>${badge}</td><td><a href="${s.url}" target="_blank" rel="noopener">buka</a></td></tr>`;
+        return `<tr><td>${esc(s.site)}</td><td>${badge}</td><td><a href="${esc(s.url)}" target="_blank" rel="noopener">buka</a></td></tr>`;
       }).join("");
-      h += `<p style="margin-top:10px;"><b>${e.found_count || 0}</b> profil terkonfirmasi ada.</p>
+      h += `<p style="margin-top:10px;"><b>${esc(e.found_count || 0)}</b> profil terkonfirmasi ada.</p>
         <table><tr><th>Situs</th><th>Status</th><th>Link</th></tr>${rows}</table>`;
     }
-    if (e.note) h += `<p class="muted" style="margin-top:12px;">ℹ️ ${e.note}</p>`;
+    if (e.note) h += `<p class="muted" style="margin-top:12px;">ℹ️ ${esc(e.note)}</p>`;
     box.innerHTML = h; refreshStats();
-  } catch (err) { box.innerHTML = `<p class="pill bad">${err.message}</p>`; }
+  } catch (err) { box.innerHTML = `<p class="pill bad">${esc(err.message)}</p>`; }
 }
 
 // ---- consent ----
@@ -188,6 +189,7 @@ async function createConsent() {
   const phone = document.getElementById("cPhone").value.trim() || null;
   const case_id = document.getElementById("cCase").value || null;
   if (!subject_label || !purpose) return alert("Isi label dan tujuan.");
+  if (!case_id && !isManager()) return alert("Pilih case dulu.");
   try {
     await api("/v1/consents", { method: "POST", body: JSON.stringify({ subject_label, purpose, retention_days, phone, case_id }) });
   } catch (e) { return alert(e.message); }
@@ -258,7 +260,7 @@ async function loadConsentsInto(selId) {
     const { consents } = await api("/v1/consents");
     const sel = document.getElementById(selId);
     if (sel) sel.innerHTML = `<option value="">Semua consent</option>` +
-      consents.map(c => `<option value="${c.id}">${c.subject_label} (${c.status})</option>`).join("");
+      consents.map(c => `<option value="${esc(c.id)}">${esc(c.subject_label)} (${esc(c.status)})</option>`).join("");
   } catch (e) {}
 }
 
@@ -283,17 +285,24 @@ async function revoke(id) {
 let CURRENT_CASE = null;
 const btnSm = 'style="margin:0 4px 0 0;padding:5px 10px;"';
 
-async function loadCasesInto(selId) {
+// Strict case ABAC: managers may create data outside any case (or a shared
+// geofence); everyone else must choose one of their own open cases.
+const isManager = () => ["admin", "case_manager"].includes(ROLE);
+async function loadCasesInto(selId, kind = "data") {
   const sel = document.getElementById(selId);
   if (!sel) return;
   const keep = sel.value;
+  const noneLabel = kind === "geofence" ? "— area bersama (semua case) —" : "— tanpa case —";
   try {
     const { cases } = await api("/v1/cases");
-    sel.innerHTML = `<option value="">— tanpa case —</option>` + cases
-      .filter(c => c.status === "open")
-      .map(c => `<option value="${esc(c.id)}">${esc(c.title)}</option>`).join("");
-    if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
-  } catch (e) { sel.innerHTML = `<option value="">— tanpa case —</option>`; }
+    const open = cases.filter(c => c.status === "open");
+    const opts = open.map(c => `<option value="${esc(c.id)}">${esc(c.title)}</option>`).join("");
+    if (isManager()) sel.innerHTML = `<option value="">${noneLabel}</option>` + opts;
+    else sel.innerHTML = opts
+      ? `<option value="" disabled selected>— pilih case (wajib) —</option>` + opts
+      : `<option value="" disabled selected>(Anda belum menjadi anggota case yang terbuka)</option>`;
+    if (keep && [...sel.options].some(o => o.value === keep)) sel.value = keep;
+  } catch (e) { sel.innerHTML = `<option value="">(gagal memuat case)</option>`; }
 }
 
 async function loadCases() {
@@ -367,6 +376,13 @@ async function openCase(id) {
         <button class="secondary" ${btnSm} onclick="attachConsent('${esc(c.id)}')">Tautkan consent</button></div>`;
     }
 
+    // geofences
+    const gfs = d.geofences || [];
+    h += `<h3>Geofence case (${gfs.length})</h3>`;
+    h += !gfs.length ? `<p class="muted">Belum ada geofence khusus case ini (buat di tab Map & Geofence).</p>` :
+      `<table><tr><th>Nama</th><th>Tipe</th></tr>` + gfs.map(g => `
+        <tr><td>${esc(g.name)}</td><td>${esc(g.kind)}${g.kind === "circle" && g.radius_m ? ` · ${esc(Math.round(g.radius_m))} m` : ""}</td></tr>`).join("") + `</table>`;
+
     // findings
     h += `<h3>Findings OSINT (${d.findings.length})</h3>`;
     h += !d.findings.length ? `<p class="muted">Belum ada finding. Pilih case ini di tab Lookup saat melakukan query.</p>` :
@@ -432,8 +448,8 @@ async function loadAudit() {
   box.innerHTML = !events.length ? `<p class="muted">Belum ada event.</p>` :
     `<table><tr><th>Waktu</th><th>Actor</th><th>Action</th><th>Resource</th><th>Detail</th></tr>` +
     events.map(ev => `<tr><td>${new Date(ev.created_at).toLocaleString()}</td>
-      <td>${ev.actor}</td><td><b>${ev.action}</b></td>
-      <td>${ev.resource_type || ""} ${ev.resource_id || ""}</td><td>${ev.detail || ""}</td></tr>`).join("") + `</table>`;
+      <td>${esc(ev.actor)}</td><td><b>${esc(ev.action)}</b></td>
+      <td>${esc(ev.resource_type)} ${esc(ev.resource_id)}</td><td>${esc(ev.detail)}</td></tr>`).join("") + `</table>`;
 }
 
 // ---- users ----
@@ -441,7 +457,7 @@ async function loadUsers() {
   const { users } = await api("/v1/users");
   document.getElementById("userList").innerHTML =
     `<table><tr><th>Username</th><th>Role</th><th>Status</th></tr>` +
-    users.map(u => `<tr><td>${u.username}</td><td><span class="pill warn">${u.role}</span></td><td>${u.status}</td></tr>`).join("") + `</table>`;
+    users.map(u => `<tr><td>${esc(u.username)}</td><td><span class="pill warn">${esc(u.role)}</span></td><td>${esc(u.status)}</td></tr>`).join("") + `</table>`;
 }
 async function createUser() {
   const username = document.getElementById("uName").value.trim();
@@ -482,6 +498,7 @@ function onKindChange() {
 function startDrawing() {
   const name = document.getElementById("gfName").value.trim();
   if (!name) return alert("Isi nama geofence dulu.");
+  if (!document.getElementById("gfCase").value && !isManager()) return alert("Pilih case untuk geofence ini.");
   drawMode = document.getElementById("gfKind").value;
   polyVertices = [];
   if (drawLayer) drawLayer.clearLayers();
@@ -534,8 +551,9 @@ async function onMapClick(e) {
     const name = document.getElementById("gfName").value.trim();
     const radius_m = parseFloat(document.getElementById("gfRadius").value) || 300;
     try {
+      const case_id = document.getElementById("gfCase").value || null;
       await api("/v1/geofences", { method: "POST", body: JSON.stringify({
-        name, kind: "circle", center_lat: e.latlng.lat, center_lng: e.latlng.lng, radius_m }) });
+        name, kind: "circle", center_lat: e.latlng.lat, center_lng: e.latlng.lng, radius_m, case_id }) });
       document.getElementById("gfName").value = "";
       resetDrawing(); loadGeofences(); loadMap(); refreshStats();
     } catch (err) { alert(err.message); }
@@ -555,8 +573,9 @@ async function finishPolygon() {
   if (polyVertices.length < 3) return alert("Polygon butuh minimal 3 titik.");
   const name = document.getElementById("gfName").value.trim();
   try {
+    const case_id = document.getElementById("gfCase").value || null;
     await api("/v1/geofences", { method: "POST", body: JSON.stringify({
-      name, kind: "polygon", polygon: polyVertices }) });
+      name, kind: "polygon", polygon: polyVertices, case_id }) });
     document.getElementById("gfName").value = "";
     resetDrawing(); loadGeofences(); loadMap(); refreshStats();
   } catch (err) { alert(err.message); }
@@ -567,14 +586,16 @@ async function loadGeofences() {
   const box = document.getElementById("gfList");
   box.innerHTML = !geofences.length ? `<p class="muted">Belum ada geofence.</p>` :
     geofences.map(g => `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);">
-      <span>${g.kind === "circle" ? "⭕" : "⬡"} ${g.name}<br><span class="muted">${g.kind === "circle" ? Math.round(g.radius_m) + " m" : (g.polygon || []).length + " titik"}</span></span>
-      <button class="danger" style="margin:0;padding:4px 9px;" onclick="delFence('${g.id}')">✕</button>
+      <span>${g.kind === "circle" ? "⭕" : "⬡"} ${esc(g.name)}<br><span class="muted">${g.kind === "circle" ? Math.round(g.radius_m) + " m" : (g.polygon || []).length + " titik"}</span>
+        ${g.case_id ? `<span class="pill warn">${esc(g.case_title || g.case_id)}</span>` : `<span class="pill">bersama</span>`}</span>
+      ${(g.case_id || isManager()) ? `<button class="danger" style="margin:0;padding:4px 9px;" data-id="${esc(g.id)}" onclick="delFence(this.dataset.id)">✕</button>` : ""}
     </div>`).join("");
   drawGeofences(geofences);
 }
 async function delFence(id) {
   if (!confirm("Hapus geofence ini?")) return;
-  await api(`/v1/geofences/${id}`, { method: "DELETE" });
+  try { await api(`/v1/geofences/${encodeURIComponent(id)}`, { method: "DELETE" }); }
+  catch (e) { return alert(e.message); }
   loadGeofences(); refreshStats();
 }
 function drawGeofences(geofences) {
@@ -584,10 +605,10 @@ function drawGeofences(geofences) {
     if (g.kind === "circle") {
       L.circle([g.center_lat, g.center_lng], { radius: g.radius_m,
         color: "#ffb454", weight: 2, fillColor: "#ffb454", fillOpacity: 0.08 })
-        .bindPopup(`<b>${g.name}</b><br>${Math.round(g.radius_m)} m`).addTo(gfLayer);
+        .bindPopup(`<b>${esc(g.name)}</b><br>${Math.round(g.radius_m)} m`).addTo(gfLayer);
     } else if (g.polygon) {
       L.polygon(g.polygon, { color: "#ffb454", weight: 2, fillOpacity: 0.08 })
-        .bindPopup(`<b>${g.name}</b>`).addTo(gfLayer);
+        .bindPopup(`<b>${esc(g.name)}</b>`).addTo(gfLayer);
     }
   });
 }
@@ -641,7 +662,7 @@ async function loadGfEvents() {
     document.getElementById("gfEvents").innerHTML = !events.length ? `<p class="muted">Belum ada event.</p>` :
       `<table><tr><th>Waktu</th><th>Geofence</th><th>Event</th></tr>` +
       events.slice(0, 40).map(ev => `<tr><td>${new Date(ev.created_at).toLocaleString()}</td>
-        <td>${ev.geofence_name || ev.geofence_id}</td>
+        <td>${esc(ev.geofence_name || ev.geofence_id)}</td>
         <td>${ev.event_type === "enter" ? '<span class="pill ok">ENTER</span>' : '<span class="pill warn">EXIT</span>'}</td></tr>`).join("") + `</table>`;
   } catch (e) {}
 }
@@ -652,7 +673,7 @@ async function loadGeofencesInto(selId) {
     const { geofences } = await api("/v1/geofences");
     const sel = document.getElementById(selId);
     if (sel) sel.innerHTML = `<option value="">—</option>` +
-      geofences.map(g => `<option value="${g.id}">${g.name} (${g.kind})</option>`).join("");
+      geofences.map(g => `<option value="${esc(g.id)}">${esc(g.name)} (${esc(g.kind)})</option>`).join("");
   } catch (e) {}
 }
 
@@ -688,7 +709,7 @@ async function runAnalytics() {
     </div>`;
     dwellBox.innerHTML = dwell.dwell.length
       ? `<table><tr><th>Geofence</th><th>Kunjungan</th><th>Dwell (menit)</th></tr>` +
-        dwell.dwell.map(d => `<tr><td>${d.geofence_name || d.geofence_id}</td><td>${d.visits}</td><td>${d.dwell_minutes}</td></tr>`).join("") + `</table>`
+        dwell.dwell.map(d => `<tr><td>${esc(d.geofence_name || d.geofence_id)}</td><td>${esc(d.visits)}</td><td>${esc(d.dwell_minutes)}</td></tr>`).join("") + `</table>`
       : `<p class="muted">Belum ada event enter/exit untuk consent ini.</p>`;
   } catch (e) { detail.innerHTML = `<p class="pill bad">${e.message}</p>`; stats.innerHTML = ""; }
 }
@@ -710,7 +731,7 @@ async function retentionPreview() {
   document.getElementById("retentionInfo").innerHTML =
     `<p><b>${d.total_expired}</b> titik melewati retention.</p>` +
     (d.by_consent.length ? `<table><tr><th>Consent</th><th>Retention</th><th>Total</th><th>Kedaluwarsa</th></tr>` +
-      d.by_consent.map(c => `<tr><td>${c.subject_label}</td><td>${c.retention_days}d</td><td>${c.total}</td><td>${c.expired}</td></tr>`).join("") + `</table>` : "");
+      d.by_consent.map(c => `<tr><td>${esc(c.subject_label)}</td><td>${esc(c.retention_days)}d</td><td>${c.total}</td><td>${c.expired}</td></tr>`).join("") + `</table>` : "");
 }
 async function retentionRun() {
   if (!confirm("Hapus permanen semua titik GPS yang melewati retention?")) return;

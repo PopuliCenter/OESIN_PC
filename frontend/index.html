@@ -65,7 +65,7 @@
             <option value="US">US</option><option value="SG">SG</option>
             <option value="MY">MY</option><option value="GB">GB</option>
           </select>
-          <label>Case (opsional) — simpan finding ke case</label>
+          <label>Case — tempat finding disimpan (wajib, kecuali case manager)</label>
           <select id="lookupCase" class="case-select"></select>
           <button onclick="doLookup()">Analyze</button>
           <button class="secondary" onclick="downloadFile('/v1/reports/findings.csv','osint_findings.csv')">⬇ Export findings CSV</button>
@@ -82,6 +82,8 @@
               <h2>Geofence baru</h2>
               <label>Nama</label>
               <input id="gfName" placeholder="mis. Area kampus" />
+              <label>Case — geofence hanya berlaku untuk consent di case ini</label>
+              <select id="gfCase" class="case-select"></select>
               <label>Tipe</label>
               <select id="gfKind" onchange="onKindChange()">
                 <option value="circle">Circle (pusat + radius)</option>
@@ -156,7 +158,7 @@
           <input id="cRetention" type="number" value="30" min="1" max="3650" />
           <label>Nomor HP subjek (opsional) — tautkan identitas OSINT</label>
           <input id="cPhone" placeholder="mis. 081908823122 (kosongkan jika tak perlu)" />
-          <label>Case (opsional)</label>
+          <label>Case (wajib, kecuali case manager)</label>
           <select id="cCase" class="case-select"></select>
           <button onclick="createConsent()">Grant Consent</button>
         </div>

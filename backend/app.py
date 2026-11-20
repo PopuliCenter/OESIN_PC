@@ -11,6 +11,9 @@ RBAC summary (admin allowed everywhere):
   geofence events          -> location_analyst, case_manager
   audit                    -> auditor
   users                    -> admin
+Case-level ABAC on top of RBAC (access.py): non-managers only see data in cases
+they are members of; data in no case is visible to admin/case_manager only.
+
 Consent-agent endpoints (public consent view, session start, point upload) are
 intentionally UNauthenticated — driven by the subject's device, gated by an
 active consent.
@@ -42,6 +45,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+import access
 import analytics
 import auth
 import database as db
@@ -331,6 +335,7 @@ class GeofenceCreate(BaseModel):
     center_lng: Optional[float] = Field(None, ge=-180, le=180)
     radius_m: Optional[float] = Field(None, gt=0)
     polygon: Optional[list[list[float]]] = None
+    case_id: Optional[str] = Field(None, pattern=r"^[A-Za-z0-9_]{1,64}$")  # None = shared
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +497,9 @@ def get_case(case_id: str,
             "SELECT id, entity_id, finding_type, source, source_kind, data_json,"
             " confidence, created_at FROM findings WHERE case_id=%s"
             " ORDER BY created_at DESC LIMIT 200", (case_id,)).fetchall()
+        geofences = db.rows_to_dicts(conn.execute(
+            "SELECT id, name, kind, radius_m, created_at FROM geofences"
+            " WHERE case_id=%s ORDER BY created_at DESC", (case_id,)).fetchall())
     finally:
         conn.close()
     for c in consents:
@@ -503,7 +511,8 @@ def get_case(case_id: str,
         out_findings.append(d)
     db.audit("CASE_ACCESS", "case", case_id, actor=user["username"])
     return {"case": case, "members": members, "consents": consents,
-            "findings": out_findings, "can_manage": user["role"] in CASE_MANAGERS}
+            "findings": out_findings, "geofences": geofences,
+            "can_manage": user["role"] in CASE_MANAGERS}
 
 
 def _set_case_status(case_id: str, user: dict, status: str) -> dict[str, Any]:
@@ -581,16 +590,28 @@ def attach_consent_to_case(case_id: str, consent_id: str,
     conn = db.get_conn()
     try:
         _case_or_403(conn, case_id, user, need_open=True)
-        row = conn.execute("SELECT case_id FROM consents WHERE id=%s", (consent_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "Consent not found.")
-        # Moving a consent out of another case requires access to that case too.
-        if row["case_id"] and row["case_id"] != case_id:
-            _case_or_403(conn, row["case_id"], user)
+        # The caller must already be able to see the consent: a consent in no
+        # case (managers only) or in another of their cases. This also stops a
+        # non-manager pulling someone else's consent into their own case.
+        consent = access.consent_or_404(conn, consent_id, user)
+        if consent["case_id"] and consent["case_id"] != case_id:
+            src = conn.execute("SELECT status FROM cases WHERE id=%s",
+                               (consent["case_id"],)).fetchone()
+            if src and src["status"] != "open":
+                raise HTTPException(409, "The consent's current case is closed;"
+                                         " reopen it before moving the consent.")
+        closed_events = []
+        if consent["case_id"] != case_id:
+            # Fences of the old case leave this consent's scope: close open states.
+            closed_events = geo.close_out_of_scope(conn, consent_id, case_id)
         conn.execute("UPDATE consents SET case_id=%s WHERE id=%s", (case_id, consent_id))
         conn.commit()
     finally:
         conn.close()
+    for ev in closed_events:
+        db.audit("GEOFENCE_EXIT", "geofence", ev["geofence_id"],
+                 f"{ev['geofence_name']} (consent moved to case {case_id})",
+                 actor=user["username"])
     db.audit("CASE_ATTACH_CONSENT", "case", case_id, consent_id, actor=user["username"])
     return {"case_id": case_id, "consent_id": consent_id}
 
@@ -605,6 +626,7 @@ def lookup(req: LookupRequest,
     id_type = enr.classify_identifier(req.value)
     if id_type == "unknown":
         raise HTTPException(422, "Could not classify identifier.")
+    access.require_case_for_non_manager(user, req.case_id)
     if req.case_id:   # check before doing any (possibly online) collection
         conn = db.get_conn()
         try:
@@ -668,10 +690,11 @@ def list_findings(limit: int = 50,
                   ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
+        csql, cparams = access.case_filter(access.allowed_cases(conn, user))
         rows = conn.execute(
             "SELECT id, entity_id, finding_type, source, source_kind, data_json,"
-            " confidence, created_at FROM findings ORDER BY created_at DESC LIMIT %s",
-            (limit,)).fetchall()
+            f" confidence, created_at, case_id FROM findings WHERE {csql}"
+            " ORDER BY created_at DESC LIMIT %s", (*cparams, limit)).fetchall()
     finally:
         conn.close()
     out = []
@@ -692,6 +715,7 @@ def create_consent(req: ConsentCreate,
     # Optional: resolve a phone identity and link it to this subject. Uses the
     # same entity resolution as /v1/lookup, so a number already looked up maps
     # to the SAME entity (OSINT identity and tracked subject become one).
+    access.require_case_for_non_manager(user, req.case_id)
     if req.case_id:
         conn = db.get_conn()
         try:
@@ -737,10 +761,7 @@ def revoke_consent(consent_id: str,
                    ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
-        row = conn.execute("SELECT id, revoked_at FROM consents WHERE id=%s",
-                           (consent_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "Consent not found.")
+        row = access.consent_or_404(conn, consent_id, user)
         if row["revoked_at"]:
             return {"consent_id": consent_id, "status": "already_revoked"}
         ts = db.now_iso()
@@ -762,6 +783,11 @@ def link_phone(consent_id: str, req: PhoneLink,
     """Attach (or replace) a phone identity on an existing consent."""
     if not req.phone or not req.phone.strip():
         raise HTTPException(422, "Phone is required.")
+    conn = db.get_conn()
+    try:
+        access.consent_or_404(conn, consent_id, user)
+    finally:
+        conn.close()
     enrich = enr.enrich_phone(req.phone, req.phone_region or "ID")
     phone_e164 = enrich.get("e164") or enr.normalize("phone", req.phone) or req.phone.strip()
     entity_id = db.upsert_entity_with_identifier(
@@ -787,7 +813,9 @@ def list_consents(user: dict = Depends(
         ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
-        rows = conn.execute("SELECT * FROM consents ORDER BY granted_at DESC").fetchall()
+        csql, cparams = access.case_filter(access.allowed_cases(conn, user))
+        rows = conn.execute(f"SELECT * FROM consents WHERE {csql} ORDER BY granted_at DESC",
+                            cparams).fetchall()
     finally:
         conn.close()
     items = []
@@ -938,13 +966,15 @@ def list_points(consent_id: Optional[str] = None, limit: int = 500,
     conn = db.get_conn()
     try:
         if consent_id:
+            access.consent_or_404(conn, consent_id, user)
             rows = conn.execute(
                 f"SELECT {cols} FROM location_points WHERE consent_id=%s"
                 f" ORDER BY captured_at {direction} LIMIT %s", (consent_id, limit)).fetchall()
         else:
+            psql, pparams = access.consent_filter(access.allowed_cases(conn, user))
             rows = conn.execute(
-                f"SELECT {cols} FROM location_points ORDER BY captured_at {direction} LIMIT %s",
-                (limit,)).fetchall()
+                f"SELECT {cols} FROM location_points WHERE {psql}"
+                f" ORDER BY captured_at {direction} LIMIT %s", (*pparams, limit)).fetchall()
     finally:
         conn.close()
     tier = resolve_precision(precision, user["role"])
@@ -959,35 +989,43 @@ def list_points(consent_id: Optional[str] = None, limit: int = 500,
 # ---------------------------------------------------------------------------
 @app.post("/v1/geofences")
 def create_geofence(req: GeofenceCreate,
-                    user: dict = Depends(auth.require_roles("location_analyst"))
+                    user: dict = Depends(auth.require_roles("location_analyst", "case_manager"))
                     ) -> dict[str, Any]:
     gid = db.new_id("gf")
     conn = db.get_conn()
     try:
+        if req.case_id:
+            _case_or_403(conn, req.case_id, user, need_open=True)
+        elif not access.is_manager(user):
+            raise HTTPException(403, "Only a case manager can create a shared geofence;"
+                                     " choose one of your cases.")
         if req.kind == "circle":
             if req.center_lat is None or req.center_lng is None or req.radius_m is None:
                 raise HTTPException(422, "circle requires center_lat, center_lng, radius_m.")
             conn.execute(
                 "INSERT INTO geofences (id, name, kind, center_lat, center_lng, radius_m,"
-                " polygon_json, polygon_geom, created_by, created_at)"
-                " VALUES (%s,%s,'circle',%s,%s,%s, NULL, NULL, %s,%s)",
+                " polygon_json, polygon_geom, created_by, created_at, case_id)"
+                " VALUES (%s,%s,'circle',%s,%s,%s, NULL, NULL, %s,%s,%s)",
                 (gid, req.name, req.center_lat, req.center_lng, req.radius_m,
-                 user["id"], db.now_iso()))
+                 user["id"], db.now_iso(), req.case_id))
         else:
             if not req.polygon or len(req.polygon) < 3:
                 raise HTTPException(422, "polygon requires >=3 [lat,lng] vertices.")
             wkt = geo.polygon_wkt(req.polygon)
             conn.execute(
                 "INSERT INTO geofences (id, name, kind, center_lat, center_lng, radius_m,"
-                " polygon_json, polygon_geom, created_by, created_at)"
+                " polygon_json, polygon_geom, created_by, created_at, case_id)"
                 " VALUES (%s,%s,'polygon', NULL, NULL, NULL, %s,"
-                " ST_GeomFromText(%s,4326), %s,%s)",
-                (gid, req.name, json.dumps(req.polygon), wkt, user["id"], db.now_iso()))
+                " ST_GeomFromText(%s,4326), %s,%s,%s)",
+                (gid, req.name, json.dumps(req.polygon), wkt, user["id"], db.now_iso(),
+                 req.case_id))
         conn.commit()
     finally:
         conn.close()
-    db.audit("GEOFENCE_CREATE", "geofence", gid, req.name, actor=user["username"])
-    return {"geofence_id": gid, "name": req.name, "kind": req.kind}
+    db.audit("GEOFENCE_CREATE", "geofence", gid,
+             req.name + (f" (case {req.case_id})" if req.case_id else " (shared)"),
+             actor=user["username"])
+    return {"geofence_id": gid, "name": req.name, "kind": req.kind, "case_id": req.case_id}
 
 
 @app.get("/v1/geofences")
@@ -996,9 +1034,12 @@ def list_geofences(user: dict = Depends(
         ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
+        gsql, gparams = access.geofence_filter(access.allowed_cases(conn, user), "g.case_id")
         rows = conn.execute(
-            "SELECT id, name, kind, center_lat, center_lng, radius_m, polygon_json,"
-            " created_by, created_at FROM geofences ORDER BY created_at DESC").fetchall()
+            "SELECT g.id, g.name, g.kind, g.center_lat, g.center_lng, g.radius_m,"
+            " g.polygon_json, g.created_by, g.created_at, g.case_id, c.title AS case_title"
+            f" FROM geofences g LEFT JOIN cases c ON c.id = g.case_id WHERE {gsql}"
+            " ORDER BY g.created_at DESC", gparams).fetchall()
     finally:
         conn.close()
     items = []
@@ -1010,10 +1051,23 @@ def list_geofences(user: dict = Depends(
 
 @app.delete("/v1/geofences/{geofence_id}")
 def delete_geofence(geofence_id: str,
-                    user: dict = Depends(auth.require_roles("location_analyst"))
+                    user: dict = Depends(auth.require_roles("location_analyst", "case_manager"))
                     ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
+        access.geofence_or_404(conn, geofence_id, user, write=True)
+        allowed = access.allowed_cases(conn, user)
+        if allowed is not None:
+            # Deleting a fence cascades to its events. Refuse if any of them
+            # belong to a consent outside the caller's cases (e.g. a consent
+            # that has since moved to another case): that is not their data.
+            foreign = conn.execute(
+                "SELECT 1 FROM geofence_events e JOIN consents c ON c.id = e.consent_id"
+                " WHERE e.geofence_id=%s AND (c.case_id IS NULL OR NOT c.case_id = ANY(%s))"
+                " LIMIT 1", (geofence_id, allowed)).fetchone()
+            if foreign:
+                raise HTTPException(409, "This geofence has events on consents outside your"
+                                         " cases; ask a case manager to delete it.")
         conn.execute("DELETE FROM geofences WHERE id=%s", (geofence_id,))
         conn.execute("DELETE FROM geofence_state WHERE geofence_id=%s", (geofence_id,))
         conn.commit()
@@ -1030,10 +1084,14 @@ def geofence_events(limit: int = 200,
                     ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
+        allowed = access.allowed_cases(conn, user)
+        csql, cparams = access.consent_filter(allowed, "e.consent_id")
+        gsql, gparams = access.geofence_filter(allowed, "g.case_id")
         rows = conn.execute(
             "SELECT e.*, g.name AS geofence_name FROM geofence_events e"
             " LEFT JOIN geofences g ON g.id = e.geofence_id"
-            " ORDER BY e.created_at DESC LIMIT %s", (limit,)).fetchall()
+            f" WHERE {csql} AND {gsql}"
+            " ORDER BY e.created_at DESC LIMIT %s", (*cparams, *gparams, limit)).fetchall()
     finally:
         conn.close()
     return {"events": db.rows_to_dicts(rows)}
@@ -1097,6 +1155,7 @@ def analytics_movement(consent_id: str, from_ts: Optional[str] = None,
                        ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
+        access.consent_or_404(conn, consent_id, user)
         result = analytics.movement_summary(conn, consent_id, from_ts, to_ts)
     finally:
         conn.close()
@@ -1111,6 +1170,7 @@ def analytics_activity_area(consent_id: str,
                             ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
+        access.consent_or_404(conn, consent_id, user)
         result = analytics.activity_area(conn, consent_id)
     finally:
         conn.close()
@@ -1126,7 +1186,12 @@ def analytics_heatmap(consent_id: Optional[str] = None, cell_m: int = 250,
                       ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
-        result = analytics.heatmap_grid(conn, consent_id, cell_m, geofence_id)
+        if consent_id:
+            access.consent_or_404(conn, consent_id, user)
+        if geofence_id:
+            access.geofence_or_404(conn, geofence_id, user)
+        result = analytics.heatmap_grid(conn, consent_id, cell_m, geofence_id,
+                                        access.allowed_cases(conn, user))
     finally:
         conn.close()
     db.audit("ANALYTICS_HEATMAP", "consent", consent_id or "all", actor=user["username"])
@@ -1140,7 +1205,10 @@ def analytics_dwell(consent_id: Optional[str] = None,
                     ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
-        result = analytics.dwell_by_geofence(conn, consent_id)
+        if consent_id:
+            access.consent_or_404(conn, consent_id, user)
+        result = analytics.dwell_by_geofence(conn, consent_id,
+                                             access.allowed_cases(conn, user))
     finally:
         conn.close()
     return result
@@ -1153,7 +1221,9 @@ def analytics_in_geofence(geofence_id: str, from_ts: Optional[str] = None,
                           ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
-        result = analytics.points_in_geofence(conn, geofence_id, from_ts, to_ts, limit)
+        access.geofence_or_404(conn, geofence_id, user)
+        result = analytics.points_in_geofence(conn, geofence_id, from_ts, to_ts, limit,
+                                              access.allowed_cases(conn, user))
     finally:
         conn.close()
     db.audit("ANALYTICS_IN_GEOFENCE", "geofence", geofence_id, actor=user["username"])
@@ -1174,6 +1244,7 @@ def report_points_csv(consent_id: str,
                       ) -> Response:
     conn = db.get_conn()
     try:
+        access.consent_or_404(conn, consent_id, user)
         data = reports.points_csv(conn, consent_id)
     finally:
         conn.close()
@@ -1188,7 +1259,8 @@ def report_events_csv(consent_id: str,
                       ) -> Response:
     conn = db.get_conn()
     try:
-        data = reports.events_csv(conn, consent_id)
+        access.consent_or_404(conn, consent_id, user)
+        data = reports.events_csv(conn, consent_id, access.allowed_cases(conn, user))
     finally:
         conn.close()
     db.audit("EXPORT_EVENTS_CSV", "consent", consent_id, actor=user["username"])
@@ -1200,7 +1272,7 @@ def report_findings_csv(user: dict = Depends(
         auth.require_roles("investigator", "case_manager"))) -> Response:
     conn = db.get_conn()
     try:
-        data = reports.findings_csv(conn)
+        data = reports.findings_csv(conn, access.allowed_cases(conn, user))
     finally:
         conn.close()
     db.audit("EXPORT_FINDINGS_CSV", "findings", "all", actor=user["username"])
@@ -1214,7 +1286,9 @@ def report_pdf(consent_id: str,
                ) -> Response:
     conn = db.get_conn()
     try:
-        pdf = reports.build_pdf(conn, consent_id, user["username"], db.now_iso())
+        access.consent_or_404(conn, consent_id, user)
+        pdf = reports.build_pdf(conn, consent_id, user["username"], db.now_iso(),
+                                access.allowed_cases(conn, user))
     except ValueError as exc:
         raise HTTPException(404, str(exc))
     finally:
@@ -1232,18 +1306,36 @@ def graph(user: dict = Depends(
         ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
-        entities = db.rows_to_dicts(conn.execute("SELECT * FROM entities").fetchall())
-        identifiers = db.rows_to_dicts(conn.execute("SELECT * FROM identifiers").fetchall())
-        consents = db.rows_to_dicts(conn.execute("SELECT * FROM consents").fetchall())
+        allowed = access.allowed_cases(conn, user)
+        csql, cp = access.case_filter(allowed)                       # consents
+        psql, pp = access.consent_filter(allowed)                    # sessions/points/events
+        gsql, gp = access.geofence_filter(allowed)                   # geofences
+        # Entities are shared across cases (exact-match resolution), so an
+        # entity is visible when a visible finding or consent points at it.
+        if allowed is None:
+            esql, ep = "TRUE", ()
+        else:
+            esql = ("(id IN (SELECT entity_id FROM findings WHERE case_id = ANY(%s))"
+                    " OR id IN (SELECT entity_id FROM consents WHERE case_id = ANY(%s)))")
+            ep = (allowed, allowed)
+        entities = db.rows_to_dicts(conn.execute(
+            f"SELECT * FROM entities WHERE {esql}", ep).fetchall())
+        identifiers = db.rows_to_dicts(conn.execute(
+            f"SELECT * FROM identifiers WHERE entity_id IN"
+            f" (SELECT id FROM entities WHERE {esql})", ep).fetchall())
+        consents = db.rows_to_dicts(conn.execute(
+            f"SELECT * FROM consents WHERE {csql}", cp).fetchall())
         sessions = db.rows_to_dicts(conn.execute(
-            "SELECT id, consent_id FROM location_sessions").fetchall())
+            f"SELECT id, consent_id FROM location_sessions WHERE {psql}", pp).fetchall())
         geofences = db.rows_to_dicts(conn.execute(
-            "SELECT id, name, kind FROM geofences").fetchall())
+            f"SELECT id, name, kind FROM geofences WHERE {gsql}", gp).fetchall())
         gf_edges = db.rows_to_dicts(conn.execute(
-            "SELECT DISTINCT consent_id, geofence_id FROM geofence_events").fetchall())
+            f"SELECT DISTINCT consent_id, geofence_id FROM geofence_events WHERE {psql}"
+            f" AND geofence_id IN (SELECT id FROM geofences WHERE {gsql})",
+            (*pp, *gp)).fetchall())
         point_counts = {r["consent_id"]: r["n"] for r in conn.execute(
-            "SELECT consent_id, COUNT(*) AS n FROM location_points GROUP BY consent_id"
-        ).fetchall()}
+            f"SELECT consent_id, COUNT(*) AS n FROM location_points WHERE {psql}"
+            " GROUP BY consent_id", pp).fetchall()}
     finally:
         conn.close()
 
@@ -1304,19 +1396,36 @@ def list_audit(limit: int = 100,
 def summary(user: dict = Depends(auth.current_user)) -> dict[str, Any]:
     conn = db.get_conn()
     try:
-        def count(table: str, where: str = "") -> int:
+        def count(table: str, where: str = "TRUE", params: tuple = ()) -> int:
             return conn.execute(
-                f"SELECT COUNT(*) AS n FROM {table} {where}").fetchone()["n"]
+                f"SELECT COUNT(*) AS n FROM {table} WHERE {where}", params).fetchone()["n"]
+
+        # Managers and auditors get organisation-wide totals (counts only).
+        # Everyone else gets totals for the cases they are a member of.
+        allowed = None if user["role"] in ("admin", "case_manager", "auditor") \
+            else access.allowed_cases(conn, user)
+        csql, cp = access.case_filter(allowed)
+        psql, pp = access.consent_filter(allowed)
+        gsql, gp = access.geofence_filter(allowed)
+        if allowed is None:
+            esql, ep = "TRUE", ()
+            case_sql, case_p = "status='open'", ()
+        else:
+            esql = ("(id IN (SELECT entity_id FROM findings WHERE case_id = ANY(%s))"
+                    " OR id IN (SELECT entity_id FROM consents WHERE case_id = ANY(%s)))")
+            ep = (allowed, allowed)
+            case_sql, case_p = "status='open' AND id = ANY(%s)", (allowed,)
         return {
-            "cases_open": count("cases", "WHERE status='open'"),
-            "entities": count("entities"),
-            "findings": count("findings"),
-            "consents_active": count("consents", "WHERE revoked_at IS NULL"),
-            "consents_total": count("consents"),
-            "location_points": count("location_points"),
-            "geofences": count("geofences"),
-            "geofence_events": count("geofence_events"),
-            "audit_events": count("audit_events"),
+            "cases_open": count("cases", case_sql, case_p),
+            "entities": count("entities", esql, ep),
+            "findings": count("findings", csql, cp),
+            "consents_active": count("consents", f"revoked_at IS NULL AND {csql}", cp),
+            "consents_total": count("consents", csql, cp),
+            "location_points": count("location_points", psql, pp),
+            "geofences": count("geofences", gsql, gp),
+            "geofence_events": count("geofence_events", psql, pp),
+            # org-wide activity counter: managers/auditors only (None otherwise)
+            "audit_events": count("audit_events") if allowed is None else None,
         }
     finally:
         conn.close()
