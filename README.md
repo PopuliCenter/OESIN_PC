@@ -168,6 +168,22 @@ docker compose up -d --build
 > Image DB memakai mirror `ghcr.io/baosystems/postgis:16-3.4` (identik dengan
 > `postgis/postgis:16-3.4`) karena CDN Docker Hub sempat memutus unduhan layer besar.
 
+## Test otomatis
+
+```bash
+docker compose run --rm app pytest
+```
+
+Test berjalan terhadap PostgreSQL + PostGIS sungguhan (service `db`), karena ABAC
+dan geofencing ditulis dalam SQL/PostGIS. Setiap run membuat database sementara
+`osint_test_*` lalu menghapusnya; database `osint` tidak tersentuh.
+
+| File | Yang diuji |
+| --- | --- |
+| `tests/test_rbac.py` | Gerbang peran: siapa boleh memanggil endpoint apa (401/403) |
+| `tests/test_abac.py` | Isolasi antar case: consent, temuan, titik, analitik, export, graph, summary; aturan pembuatan data; case tertutup; pencabutan anggota; scoping evaluasi geofence |
+| `tests/test_public_surface.py` | Guard tunnel, token tulis per sesi, consent yang di-revoke, nilai titik palsu |
+
 ## Uji GPS dari HP sungguhan (tunnel HTTPS)
 
 Browser HP hanya memberi GPS ke halaman **HTTPS**. Service `tunnel` (cloudflared
