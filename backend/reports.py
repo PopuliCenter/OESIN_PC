@@ -19,11 +19,24 @@ def _ascii(s: Any) -> str:
 
 
 # --- CSV --------------------------------------------------------------------
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _cell(value: Any) -> Any:
+    """Neutralise CSV formula injection: a text cell that starts like a formula
+    (e.g. a geofence named "=HYPERLINK(...)") would run when the export is
+    opened in Excel/Sheets. Numbers are left alone, so negative coordinates
+    stay numeric."""
+    if isinstance(value, str) and value.startswith(_FORMULA_START):
+        return "'" + value
+    return value
+
+
 def _csv_from_rows(header: list[str], rows: list[list[Any]]) -> str:
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(header)
-    w.writerows(rows)
+    w.writerows([[_cell(v) for v in row] for row in rows])
     return buf.getvalue()
 
 

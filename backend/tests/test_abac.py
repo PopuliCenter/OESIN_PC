@@ -233,6 +233,76 @@ def test_moving_a_consent_closes_its_open_geofence_states(client, world, make_us
     assert ana_g.delete(f"/v1/geofences/{fence}").status_code == 409
 
 
+# --- regressions from the independent review of this branch ----------------------------------------
+def test_closed_case_freezes_location_collection(client, world, make_user):
+    m, inv = world.manager, make_user("inv_fz", "investigator")
+    case = new_case(m, inv)
+    consent = inv.post("/v1/consents", json={"subject_label": "x", "purpose": "x",
+                                             "case_id": case}).json()["consent_id"]
+    sid, tok = start_session(client, consent)
+    assert m.post(f"/v1/cases/{case}/close").status_code == 200
+    assert send_point(client, sid, tok, -6.6, 106.6).status_code == 409
+    assert client.post("/v1/location/sessions", json={"consent_id": consent}).status_code == 409
+    assert m.post(f"/v1/cases/{case}/reopen").status_code == 200
+    assert send_point(client, sid, tok, -6.6, 106.6).status_code == 200
+
+
+def test_closed_case_blocks_phone_link_and_fence_delete(world, make_user):
+    m = world.manager
+    inv, ana = make_user("inv_cz", "investigator"), make_user("ana_cz", "location_analyst")
+    case = new_case(m, inv, ana)
+    consent = inv.post("/v1/consents", json={"subject_label": "x", "purpose": "x",
+                                             "case_id": case}).json()["consent_id"]
+    fence = ana.post("/v1/geofences", json={"name": "z", "kind": "circle", "center_lat": 2,
+                                            "center_lng": 2, "radius_m": 10,
+                                            "case_id": case}).json()["geofence_id"]
+    assert m.post(f"/v1/cases/{case}/close").status_code == 200
+    assert inv.post(f"/v1/consents/{consent}/link-phone", json={"phone": "081200000002"}).status_code == 409
+    assert ana.delete(f"/v1/geofences/{fence}").status_code == 409
+    assert m.delete(f"/v1/geofences/{fence}").status_code == 409
+    assert m.post(f"/v1/cases/{case}/reopen").status_code == 200
+    assert ana.delete(f"/v1/geofences/{fence}").status_code == 200
+
+
+def test_case_geofence_analytics_ignore_other_cases(world, seed):
+    """Consent B passed through fence A's area. Fence A belongs to case A, so even
+    a viewer who sees both cases must not count consent B's point in it."""
+    admin = seed["admin"]
+    inside = admin.get(f"/v1/analytics/in-geofence?geofence_id={world.fence_a}").json()
+    assert {p["consent_id"] for p in inside["points"]} == {world.consent_a}
+    heat = admin.get(f"/v1/analytics/heatmap?geofence_id={world.fence_a}").json()
+    assert sum(c["weight"] for c in heat["cells"]) == 1
+
+
+def test_moving_a_consent_audits_its_source_case(world, seed):
+    m = world.manager
+    src, dst = new_case(m), new_case(m)
+    consent = m.post("/v1/consents", json={"subject_label": "x", "purpose": "x",
+                                           "case_id": src}).json()["consent_id"]
+    assert m.post(f"/v1/cases/{dst}/consents/{consent}").status_code == 200
+    rows = seed["auditor"].get("/v1/audit?limit=500").json()["events"]
+    assert any(r["action"] == "CASE_ATTACH_CONSENT" and r["resource_id"] == dst
+               and r["detail"] == f"{consent} from {src}" for r in rows)
+
+
+def test_csv_export_neutralises_formulas(client, world, make_user):
+    m, ana = world.manager, make_user("ana_csv", "location_analyst")
+    case = new_case(m, ana)
+    spot = (-6.75, 106.75)
+    ana.post("/v1/geofences", json={"name": '=HYPERLINK("http://evil.example","x")',
+                                    "kind": "circle", "center_lat": spot[0],
+                                    "center_lng": spot[1], "radius_m": 100, "case_id": case})
+    consent = m.post("/v1/consents", json={"subject_label": "x", "purpose": "x",
+                                           "case_id": case}).json()["consent_id"]
+    sid, tok = start_session(client, consent)
+    assert send_point(client, sid, tok, *spot).status_code == 200
+    import csv
+    import io
+    rows = list(csv.DictReader(io.StringIO(ana.get(f"/v1/reports/consent/{consent}/events.csv").text)))
+    assert rows and all(r["geofence"].startswith("'=HYPERLINK") for r in rows)
+    assert all(r["latitude"] == "-6.75" for r in rows)   # negative numbers are not touched
+
+
 def test_world_points_landed_where_expected(world):
     """Sanity check of the fixture itself, so a broken fixture fails loudly."""
     pts = world.manager.get("/v1/location/points?limit=1000").json()["points"]

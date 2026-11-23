@@ -612,7 +612,9 @@ def attach_consent_to_case(case_id: str, consent_id: str,
         db.audit("GEOFENCE_EXIT", "geofence", ev["geofence_id"],
                  f"{ev['geofence_name']} (consent moved to case {case_id})",
                  actor=user["username"])
-    db.audit("CASE_ATTACH_CONSENT", "case", case_id, consent_id, actor=user["username"])
+    # Record where the consent came from, so a move between cases can be reconstructed.
+    db.audit("CASE_ATTACH_CONSENT", "case", case_id,
+             f"{consent_id} from {consent['case_id'] or 'no case'}", actor=user["username"])
     return {"case_id": case_id, "consent_id": consent_id}
 
 
@@ -785,7 +787,9 @@ def link_phone(consent_id: str, req: PhoneLink,
         raise HTTPException(422, "Phone is required.")
     conn = db.get_conn()
     try:
-        access.consent_or_404(conn, consent_id, user)
+        consent = access.consent_or_404(conn, consent_id, user)
+        if consent["case_id"]:
+            _case_or_403(conn, consent["case_id"], user, need_open=True)
     finally:
         conn.close()
     enrich = enr.enrich_phone(req.phone, req.phone_region or "ID")
@@ -850,12 +854,17 @@ def public_consent(consent_id: str) -> dict[str, Any]:
 # Location sessions + points (public, consent-gated) + geofence evaluation
 # ---------------------------------------------------------------------------
 def _active_consent_or_404(conn, consent_id: str):
-    row = conn.execute("SELECT id, revoked_at FROM consents WHERE id=%s",
-                       (consent_id,)).fetchone()
+    """Collection is allowed only for a non-revoked consent whose case (if any)
+    is open: a closed case is frozen evidence, so nothing new may land in it."""
+    row = conn.execute(
+        "SELECT c.id, c.revoked_at, k.status AS case_status FROM consents c"
+        " LEFT JOIN cases k ON k.id = c.case_id WHERE c.id=%s", (consent_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Consent not found.")
     if row["revoked_at"]:
         raise HTTPException(403, "Consent has been revoked; collection is not allowed.")
+    if row["case_status"] is not None and row["case_status"] != "open":
+        raise HTTPException(409, "This consent's case is closed; collection is paused.")
     return row
 
 
@@ -1055,7 +1064,10 @@ def delete_geofence(geofence_id: str,
                     ) -> dict[str, Any]:
     conn = db.get_conn()
     try:
-        access.geofence_or_404(conn, geofence_id, user, write=True)
+        fence = access.geofence_or_404(conn, geofence_id, user, write=True)
+        if fence["case_id"]:
+            # Deleting cascades to the fence's events: not allowed in a closed case.
+            _case_or_403(conn, fence["case_id"], user, need_open=True)
         allowed = access.allowed_cases(conn, user)
         if allowed is not None:
             # Deleting a fence cascades to its events. Refuse if any of them

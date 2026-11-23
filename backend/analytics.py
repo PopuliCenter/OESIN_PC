@@ -113,7 +113,11 @@ def points_in_geofence(conn, geofence_id: str,
              AND ST_DWithin(
                  ST_SetSRID(ST_MakePoint(g.center_lng, g.center_lat), 4326)::geography,
                  p.geom, g.radius_m))
-        ) {tc}
+        )
+        -- a case geofence only applies to its own case's consents (as in geo.evaluate_point)
+        AND (g.case_id IS NULL
+             OR p.consent_id IN (SELECT id FROM consents WHERE case_id = g.case_id))
+        {tc}
         ORDER BY p.captured_at DESC
         LIMIT %(limit)s
     """, params).fetchall()
@@ -149,7 +153,9 @@ def heatmap_grid(conn, consent_id: Optional[str] = None, cell_m: int = 250,
                AND ST_DWithin(
                    ST_SetSRID(ST_MakePoint(g.center_lng, g.center_lat), 4326)::geography,
                    location_points.geom, g.radius_m))
-          ))"""
+          ) AND (g.case_id IS NULL
+                 OR location_points.consent_id IN
+                    (SELECT id FROM consents WHERE case_id = g.case_id)))"""
 
     rows = conn.execute(f"""
         WITH snapped AS (
